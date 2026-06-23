@@ -1,0 +1,100 @@
+services:
+
+  # ── BASE DE DATOS ────────────────────────────────────────────────────────────
+  # Postgres con pgvector habilitado.
+  # pgvector es la extensión que permite guardar y buscar embeddings —
+  # los vectores numéricos que representan tu código para búsqueda semántica.
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: alfred_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: alfred
+      POSTGRES_PASSWORD: alfred_dev_password
+      POSTGRES_DB: alfred_db
+    ports:
+      - "5432:5432"          # accesible desde tu máquina en localhost:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # datos persisten entre reinicios
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alfred -d alfred_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── POLICY ENGINE ────────────────────────────────────────────────────────────
+  # Open Policy Agent — el "guardián" que evalúa si el output de cada agente
+  # cumple las políticas definidas en Rego antes de pasarlo al siguiente agente.
+  # Corre como un servidor HTTP: FastAPI le pregunta, OPA responde allow/deny.
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: alfred_opa
+    restart: unless-stopped
+    command:
+      - "run"
+      - "--server"                        # modo servidor HTTP
+      - "--addr=0.0.0.0:8181"
+      - "--log-format=json"
+      - "/policies"                       # carpeta donde viven las reglas Rego
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./infra/opa/policies:/policies    # tus reglas Rego van aquí
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8181/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── PANEL DE BASE DE DATOS ───────────────────────────────────────────────────
+  # pgAdmin: interfaz web para ver y editar la base de datos.
+  # Útil mientras aprendes — puedes ver exactamente qué guarda cada agente.
+  # En producción esto no va. Por ahora es tu ventana a Postgres.
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: alfred_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@alfred.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"   # modo single-user, sin login
+    ports:
+      - "5050:80"            # abre http://localhost:5050 en tu browser
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./infra/pgadmin/servers.json:/pgadmin4/servers.json  # pre-conecta a postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── REDIS ────────────────────────────────────────────────────────────────────
+  # Cola de tareas para el orquestador de agentes.
+  # Cuando Alfred recibe un run, las tareas se encolan aquí para procesarlas
+  # en orden. También sirve como caché de respuestas para prompts repetidos.
+  redis:
+    image: redis:7-alpine
+    container_name: alfred_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ── VOLÚMENES ─────────────────────────────────────────────────────────────────
+# Los volúmenes son carpetas gestionadas por Docker que persisten
+# aunque pares y reinicies los contenedores.
+volumes:
+  postgres_data:
+  pgadmin_data:
+  redis_data:
+
+# ── RED INTERNA ───────────────────────────────────────────────────────────────
+# Docker crea automáticamente una red privada entre estos servicios.
+# FastAPI (que correrá fuera de Docker mientras desarrollas) se conecta
+# a cada servicio por localhost:PUERTO desde tu máquina.

@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Alfred DB",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "alfred_db",
+      "Username": "alfred",
+      "Password": "alfred_dev_password",
+      "SSLMode": "prefer",
+      "PassFile": "/tmp/pgpassfile"
+    }
+  }
+}
