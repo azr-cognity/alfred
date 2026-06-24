@@ -3,6 +3,7 @@ from enum import Enum
 from uuid import UUID
 
 from pydantic import BaseModel
+from typing import Optional
 
 
 # ── Enums ──────────────────────────────────────────────────────────────────────
@@ -12,6 +13,7 @@ class RunStatus(str, Enum):
     RUNNING   = "running"
     DONE      = "done"
     FAILED    = "failed"
+    QUEUED    = "queued"
 
 
 class TaskPriority(str, Enum):
@@ -56,8 +58,8 @@ class RunResponse(BaseModel):
     id: UUID
     status: RunStatus
     prompt: str
-    plan: Plan | None = None
-    current_agent: str | None = None
+    plan: Optional[object] = None 
+    current_agent: Optional[str] = None  
     error: str | None = None
     created_at: datetime
     completed_at: datetime | None = None

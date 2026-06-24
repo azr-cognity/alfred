@@ -87,6 +87,7 @@ def _extract_json(text: str) -> str:
     o lo envuelve en ```json ... ```. Esta función lo limpia.
     """
     # Intentar extraer de bloque markdown
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         return match.group(1).strip()
