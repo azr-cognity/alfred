@@ -33,7 +33,13 @@ class Settings(BaseSettings):
     alfred_log_level: str = "INFO"
     alfred_max_agent_retries: int = 3
     alfred_min_coverage: int = 75
-    alfred_project_root: str = "C:/Cognity/products/alfred/alfred-api"  # ← agregar esta
+    alfred_project_root: str = "C:/Cognity/products/alfred/alfred-api"
+
+    # ── GitHub ─────────────────────────────────────────────────────────────────
+    github_token: str = ""          # Personal Access Token con permisos repo
+    github_repo: str = "azr-cognity/alfred"  # owner/repo
+    github_base_branch: str = "main"         # branch destino de las PRs
+
 
 # Instancia global — importar desde aquí en todo el proyecto
 settings = Settings()

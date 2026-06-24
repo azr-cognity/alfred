@@ -1,12 +1,10 @@
 """
-Orquestador LangGraph — estado del grafo (S7).
+Orquestador LangGraph — estado del grafo (S8).
 
-Cambios respecto a S6:
-  - retry_counts: dict[str, int]  — contador de reintentos Reviewer por task_id
-  - reviewer_feedback: Optional[str]  — feedback del último rechazo del Reviewer
-  - tester_retry_counts: dict[str, int]  — contador de reintentos Tester por task_id
-  - tester_feedback: Optional[str]  — feedback del último fallo del Tester
-  - initial_state(): función helper que el worker usa para arrancar el grafo
+Cambios respecto a S7:
+  - all_files_written: Annotated[list[str], operator.add]
+    Campo acumulativo — cada coder_node agrega sus archivos.
+    El Auditor lo consume al final del run para auditar y abrir la PR.
 """
 
 import operator
@@ -41,6 +39,7 @@ class GraphState(dict):
     Campos acumulativos (Annotated con operator.add):
       - completed: lista de task_ids completados
       - steps: historial de pasos de cada agente
+      - all_files_written: todos los archivos escritos en el run (para el Auditor)
 
     Campos escalares (reemplazados en cada update):
       - run_id, prompt, plan, current_task_id, status, error
@@ -56,6 +55,7 @@ class GraphState(dict):
     current_task_id: Optional[str]
     completed: Annotated[list[str], operator.add]
     steps: Annotated[list[AgentStep], operator.add]
+    all_files_written: Annotated[list[str], operator.add]
     status: RunStatus
     error: Optional[str]
     retry_counts: dict         # task_id -> int (Reviewer)
@@ -65,15 +65,7 @@ class GraphState(dict):
 
 
 def initial_state(run_id: str, prompt: str) -> dict:
-    """Construye el estado inicial del grafo para un nuevo run.
-
-    Args:
-        run_id: ID del run (UUID generado por la API)
-        prompt: prompt del usuario
-
-    Returns:
-        dict compatible con GraphState para pasar a compiled_graph.astream()
-    """
+    """Construye el estado inicial del grafo para un nuevo run."""
     return {
         "run_id": run_id,
         "prompt": prompt,
@@ -81,6 +73,7 @@ def initial_state(run_id: str, prompt: str) -> dict:
         "current_task_id": None,
         "completed": [],
         "steps": [],
+        "all_files_written": [],
         "status": "queued",
         "error": None,
         "retry_counts": {},
@@ -104,7 +97,6 @@ def validate_dag(plan: Plan) -> None:
                     f"task '{task.id}' depende de '{dep}' que no existe en el plan"
                 )
 
-    # Detección de ciclos con Kahn
     from collections import defaultdict, deque
 
     in_degree: dict[str, int] = {t.id: 0 for t in plan.tasks}

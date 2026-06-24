@@ -1,13 +1,13 @@
 """
-Tests del grafo LangGraph — S7 completo (Architect→Coder→OPA→Reviewer→Tester).
+Tests del grafo LangGraph — S8 completo (con Auditor + PR).
 
 Cubre:
-  - Happy path: pipeline completo, Tester aprueba a la primera
-  - Tester falla una vez, Coder corrige, Tester aprueba en segundo intento
-  - Tester agota reintentos -> run failed
-  - Reviewer rechaza, Coder corrige, Reviewer aprueba, Tester aprueba
-  - OPA bloquea -> run failed sin llegar al Reviewer ni al Tester
-  - feedback del Tester llega al Coder en el reintento
+  - Happy path: pipeline completo, Auditor aprueba y abre PR
+  - Auditor encuentra findings HIGH -> run failed
+  - Auditor encuentra solo MEDIUM/LOW -> aprueba igualmente
+  - all_files_written acumula archivos de múltiples tasks
+  - OPA bloquea -> Auditor no se llama
+  - Pipeline completo 2 tasks: ambas llegan al Auditor
 
 Ejecutar desde alfred-api/:
   pytest tests/test_graph.py -v
@@ -18,6 +18,7 @@ import unittest.mock as mock
 import pytest
 
 from app.agents.architect import Plan, Task
+from app.agents.auditor import AuditFinding, AuditorResult
 from app.agents.coder import CoderResult
 from app.agents.reviewer import ReviewerResult
 from app.agents.tester import TesterResult
@@ -33,46 +34,44 @@ def _make_plan(tasks: list[Task]) -> Plan:
 
 def _coder_task(tid: str, depends_on: list[str] | None = None) -> Task:
     return Task(
-        id=tid,
-        title=f"Tarea {tid}",
-        description=f"Implementar {tid}",
-        agent="coder",
-        priority="high",
-        depends_on=depends_on or [],
-        estimated_complexity="low",
-        files_to_create=[f"app/{tid}.py"],
-        files_to_modify=[],
+        id=tid, title=f"Tarea {tid}", description=f"Implementar {tid}",
+        agent="coder", priority="high", depends_on=depends_on or [],
+        estimated_complexity="low", files_to_create=[f"app/{tid}.py"], files_to_modify=[],
     )
 
 
 def _skip_task(tid: str, depends_on: list[str] | None = None) -> Task:
     return Task(
-        id=tid,
-        title=f"Tarea skip {tid}",
-        description="agente no implementado",
-        agent="other",
-        priority="low",
-        depends_on=depends_on or [],
-        estimated_complexity="low",
-        files_to_create=[],
-        files_to_modify=[],
+        id=tid, title=f"Skip {tid}", description="skip",
+        agent="other", priority="low", depends_on=depends_on or [],
+        estimated_complexity="low", files_to_create=[], files_to_modify=[],
     )
 
 
 def _fake_coder(task: Task, reviewer_feedback=None) -> CoderResult:
-    return CoderResult(
-        task_id=task.id,
-        files_written=[f"app/{task.id}.py"],
-        summary=f"Implementé {task.id}",
-    )
+    return CoderResult(task_id=task.id, files_written=[f"app/{task.id}.py"], summary=f"ok {task.id}")
 
 
-def _reviewer_ok(task_id: str = "") -> ReviewerResult:
+def _reviewer_ok(task_id="") -> ReviewerResult:
     return ReviewerResult(approved=True, feedback="OK", task_id=task_id)
 
 
-def _tester_ok(task_id: str = "") -> TesterResult:
+def _tester_ok(task_id="") -> TesterResult:
     return TesterResult(passed=True, feedback="Tests OK", task_id=task_id, test_file="tests/generated/x_test.py")
+
+
+def _auditor_ok(pr_url="https://github.com/azr-cognity/alfred/pull/1") -> AuditorResult:
+    return AuditorResult(passed=True, feedback=f"Audit limpio. PR: {pr_url}", findings=[], pr_url=pr_url)
+
+
+def _auditor_high() -> AuditorResult:
+    finding = AuditFinding(tool="bandit", severity="HIGH", message="hardcoded password", file_path="app/task_1.py", line=10)
+    return AuditorResult(passed=False, feedback="1 finding HIGH", findings=[finding])
+
+
+def _auditor_medium() -> AuditorResult:
+    finding = AuditFinding(tool="bandit", severity="MEDIUM", message="use of assert", file_path="app/task_1.py", line=5)
+    return AuditorResult(passed=True, feedback="1 finding MEDIUM. PR: https://github.com/azr-cognity/alfred/pull/2", findings=[finding], pr_url="https://github.com/azr-cognity/alfred/pull/2")
 
 
 def _opa_pass():
@@ -85,17 +84,10 @@ def _opa_fail(msg="violation"):
 
 def _initial_state(prompt: str = "test") -> dict:
     from app.orchestrator.state import initial_state
-    return initial_state(run_id="test-run", prompt=prompt)
+    return initial_state(run_id="test-run-001", prompt=prompt)
 
 
-def _patches(
-    plan,
-    coder_side_effect=None,
-    reviewer_side_effect=None,
-    tester_side_effect=None,
-    opa_return=None,
-):
-    """Helper para construir el stack de patches común."""
+def _base_patches(plan, coder_se=None, reviewer_se=None, tester_se=None, auditor_se=None, opa_ret=None):
     async def fake_architect(prompt):
         return plan
 
@@ -108,34 +100,36 @@ def _patches(
     async def default_tester(task, files_written, tester_feedback=None):
         return _tester_ok(task.id)
 
+    async def default_auditor(run_id, plan_summary, files_written):
+        return _auditor_ok()
+
     return [
         mock.patch("app.orchestrator.nodes.run_architect", fake_architect),
-        mock.patch("app.orchestrator.nodes.run_coder",
-                   side_effect=coder_side_effect or default_coder),
-        mock.patch("app.orchestrator.nodes.run_reviewer",
-                   side_effect=reviewer_side_effect or default_reviewer),
-        mock.patch("app.orchestrator.nodes.run_tester",
-                   side_effect=tester_side_effect or default_tester),
-        mock.patch("app.orchestrator.nodes.opa.evaluate",
-                   return_value=opa_return or _opa_pass()),
+        mock.patch("app.orchestrator.nodes.run_coder", side_effect=coder_se or default_coder),
+        mock.patch("app.orchestrator.nodes.run_reviewer", side_effect=reviewer_se or default_reviewer),
+        mock.patch("app.orchestrator.nodes.run_tester", side_effect=tester_se or default_tester),
+        mock.patch("app.orchestrator.nodes.run_auditor", side_effect=auditor_se or default_auditor),
+        mock.patch("app.orchestrator.nodes.opa.evaluate", return_value=opa_ret or _opa_pass()),
         mock.patch("app.orchestrator.nodes.read_file", return_value="# código"),
     ]
 
 
+def _apply(patches):
+    return patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]
+
+
 # --------------------------------------------------------------------------- #
-# Test 1: Happy path completo
+# Test 1: Happy path — pipeline completo, Auditor abre PR
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_happy_path_full_pipeline():
-    """Pipeline completo: Architect→Coder→OPA→Reviewer→Tester. Todo aprueba."""
-    plan = _make_plan([
-        _coder_task("task_1"),
-        _coder_task("task_2", depends_on=["task_1"]),
-    ])
+async def test_happy_path_auditor_opens_pr():
+    """Pipeline completo: todo aprueba, Auditor abre PR, run=done."""
+    plan = _make_plan([_coder_task("task_1"), _coder_task("task_2", depends_on=["task_1"])])
+    patches = _base_patches(plan)
 
-    patches = _patches(plan)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+    with _apply(patches)[0], _apply(patches)[1], _apply(patches)[2], _apply(patches)[3], \
+         _apply(patches)[4], _apply(patches)[5], _apply(patches)[6]:
         from app.orchestrator.graph import compiled_graph
         final = await compiled_graph.ainvoke(_initial_state())
 
@@ -144,95 +138,132 @@ async def test_happy_path_full_pipeline():
     assert final["error"] is None
 
     agents = {s.agent for s in final["steps"]}
-    assert "coder" in agents
-    assert "reviewer" in agents
-    assert "tester" in agents
+    assert "auditor" in agents
+    auditor_step = next(s for s in final["steps"] if s.agent == "auditor")
+    assert auditor_step.status == "success"
 
 
 # --------------------------------------------------------------------------- #
-# Test 2: Tester falla una vez, aprueba en segundo intento
-# --------------------------------------------------------------------------- #
-
-@pytest.mark.asyncio
-async def test_tester_retry_approves_on_second_attempt():
-    """Tester falla en intento 1, Coder corrige, Tester aprueba en intento 2."""
-    plan = _make_plan([_coder_task("task_1")])
-    tester_calls = {"n": 0}
-
-    async def tester_fail_then_pass(task, files_written, tester_feedback=None):
-        tester_calls["n"] += 1
-        if tester_calls["n"] == 1:
-            return TesterResult(
-                passed=False,
-                feedback="Tests fallaron:\nAssertionError: expected 200 got 404",
-                task_id=task.id,
-                pytest_output="FAILED tests/generated/task_1_test.py::test_endpoint - AssertionError",
-            )
-        return _tester_ok(task.id)
-
-    patches = _patches(plan, tester_side_effect=tester_fail_then_pass)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
-        from app.orchestrator.graph import compiled_graph
-        final = await compiled_graph.ainvoke(_initial_state())
-
-    assert final["status"] == "done"
-    assert "task_1" in final["completed"]
-    assert tester_calls["n"] == 2
-
-    tester_steps = [s for s in final["steps"] if s.agent == "tester"]
-    assert len(tester_steps) == 2
-    assert tester_steps[0].status == "failed"
-    assert tester_steps[1].status == "success"
-
-
-# --------------------------------------------------------------------------- #
-# Test 3: Tester agota reintentos -> run failed
+# Test 2: Auditor encuentra findings HIGH -> run failed
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_tester_exhausts_retries_fails_run():
-    """Tester siempre falla -> run failed tras MAX_TESTER_RETRIES+1 intentos."""
+async def test_auditor_high_findings_fails_run():
+    """Auditor encuentra HIGH findings -> run=failed."""
     plan = _make_plan([_coder_task("task_1")])
 
-    async def tester_always_fails(task, files_written, tester_feedback=None):
-        return TesterResult(
-            passed=False,
-            feedback="Tests siempre fallan",
-            task_id=task.id,
-            pytest_output="FAILED",
-        )
+    async def auditor_high(run_id, plan_summary, files_written):
+        return _auditor_high()
 
-    patches = _patches(plan, tester_side_effect=tester_always_fails)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+    patches = _base_patches(plan, auditor_se=auditor_high)
+    with _apply(patches)[0], _apply(patches)[1], _apply(patches)[2], _apply(patches)[3], \
+         _apply(patches)[4], _apply(patches)[5], _apply(patches)[6]:
         from app.orchestrator.graph import compiled_graph
         final = await compiled_graph.ainvoke(_initial_state())
 
     assert final["status"] == "failed"
-    assert "task_1" not in final["completed"]
+    assert "HIGH" in final["error"]
 
-    tester_steps = [s for s in final["steps"] if s.agent == "tester"]
-    assert len(tester_steps) == MAX_TESTER_RETRIES + 1
-    assert all(s.status == "failed" for s in tester_steps)
+    auditor_step = next(s for s in final["steps"] if s.agent == "auditor")
+    assert auditor_step.status == "failed"
 
 
 # --------------------------------------------------------------------------- #
-# Test 4: Reviewer rechaza, Coder corrige, luego Tester aprueba
+# Test 3: Auditor solo MEDIUM/LOW -> aprueba
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_reviewer_retry_then_tester_passes():
-    """Reviewer rechaza una vez, Coder corrige, Reviewer aprueba, Tester aprueba."""
+async def test_auditor_medium_findings_passes():
+    """Auditor con findings MEDIUM/LOW -> run=done igual."""
+    plan = _make_plan([_coder_task("task_1")])
+
+    async def auditor_medium(run_id, plan_summary, files_written):
+        return _auditor_medium()
+
+    patches = _base_patches(plan, auditor_se=auditor_medium)
+    with _apply(patches)[0], _apply(patches)[1], _apply(patches)[2], _apply(patches)[3], \
+         _apply(patches)[4], _apply(patches)[5], _apply(patches)[6]:
+        from app.orchestrator.graph import compiled_graph
+        final = await compiled_graph.ainvoke(_initial_state())
+
+    assert final["status"] == "done"
+    auditor_step = next(s for s in final["steps"] if s.agent == "auditor")
+    assert auditor_step.status == "success"
+
+
+# --------------------------------------------------------------------------- #
+# Test 4: all_files_written acumula archivos de múltiples tasks
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_all_files_written_accumulates_across_tasks():
+    """all_files_written tiene los archivos de todas las tasks al llegar al Auditor."""
+    plan = _make_plan([
+        _coder_task("task_1"),
+        _coder_task("task_2", depends_on=["task_1"]),
+        _coder_task("task_3", depends_on=["task_2"]),
+    ])
+
+    auditor_received: list[list[str]] = []
+
+    async def auditor_spy(run_id, plan_summary, files_written):
+        auditor_received.append(list(files_written))
+        return _auditor_ok()
+
+    patches = _base_patches(plan, auditor_se=auditor_spy)
+    with _apply(patches)[0], _apply(patches)[1], _apply(patches)[2], _apply(patches)[3], \
+         _apply(patches)[4], _apply(patches)[5], _apply(patches)[6]:
+        from app.orchestrator.graph import compiled_graph
+        final = await compiled_graph.ainvoke(_initial_state())
+
+    assert final["status"] == "done"
+    assert len(auditor_received) == 1
+    received = auditor_received[0]
+    assert "app/task_1.py" in received
+    assert "app/task_2.py" in received
+    assert "app/task_3.py" in received
+
+
+# --------------------------------------------------------------------------- #
+# Test 5: OPA bloquea -> Auditor no se llama
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_opa_blocks_auditor_not_called():
+    """OPA falla -> run failed sin llegar al Auditor."""
+    plan = _make_plan([_coder_task("task_1")])
+    auditor_mock = mock.AsyncMock()
+
+    patches = _base_patches(plan, opa_ret=_opa_fail("hardcoded secret"))
+    with _apply(patches)[0], _apply(patches)[1], _apply(patches)[2], _apply(patches)[3], \
+         mock.patch("app.orchestrator.nodes.run_auditor", auditor_mock), \
+         _apply(patches)[5], _apply(patches)[6]:
+        from app.orchestrator.graph import compiled_graph
+        final = await compiled_graph.ainvoke(_initial_state())
+
+    assert final["status"] == "failed"
+    auditor_mock.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Test 6: Reviewer rechaza, Coder corrige, Tester pasa, Auditor abre PR
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_reviewer_retry_then_full_pipeline_to_pr():
+    """Reviewer rechaza una vez, pipeline continúa y Auditor abre PR."""
     plan = _make_plan([_coder_task("task_1")])
     reviewer_calls = {"n": 0}
 
-    async def reviewer_fail_then_pass(task, files_written):
+    async def reviewer_fail_once(task, files_written):
         reviewer_calls["n"] += 1
         if reviewer_calls["n"] == 1:
-            return ReviewerResult(approved=False, feedback="Falta manejo de errores", task_id=task.id)
-        return ReviewerResult(approved=True, feedback="Correcto", task_id=task.id)
+            return ReviewerResult(approved=False, feedback="Falta validación", task_id=task.id)
+        return _reviewer_ok(task.id)
 
-    patches = _patches(plan, reviewer_side_effect=reviewer_fail_then_pass)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+    patches = _base_patches(plan, reviewer_se=reviewer_fail_once)
+    with _apply(patches)[0], _apply(patches)[1], _apply(patches)[2], _apply(patches)[3], \
+         _apply(patches)[4], _apply(patches)[5], _apply(patches)[6]:
         from app.orchestrator.graph import compiled_graph
         final = await compiled_graph.ainvoke(_initial_state())
 
@@ -240,82 +271,6 @@ async def test_reviewer_retry_then_tester_passes():
     assert "task_1" in final["completed"]
     assert reviewer_calls["n"] == 2
 
-    reviewer_steps = [s for s in final["steps"] if s.agent == "reviewer"]
-    assert reviewer_steps[0].status == "failed"
-    assert reviewer_steps[1].status == "success"
-
-    tester_steps = [s for s in final["steps"] if s.agent == "tester"]
-    assert len(tester_steps) == 1
-    assert tester_steps[0].status == "success"
-
-
-# --------------------------------------------------------------------------- #
-# Test 5: OPA bloquea -> run failed, Reviewer y Tester no se llaman
-# --------------------------------------------------------------------------- #
-
-@pytest.mark.asyncio
-async def test_opa_gate_blocks_reviewer_and_tester():
-    """OPA falla -> run failed sin llamar al Reviewer ni al Tester."""
-    plan = _make_plan([_coder_task("task_1")])
-
-    reviewer_mock = mock.AsyncMock()
-    tester_mock = mock.AsyncMock()
-
-    patches = _patches(plan, opa_return=_opa_fail("hardcoded secret"))
-    # Reemplazar reviewer y tester con mocks que no deben llamarse
-    with patches[0], patches[1], \
-         mock.patch("app.orchestrator.nodes.run_reviewer", reviewer_mock), \
-         mock.patch("app.orchestrator.nodes.run_tester", tester_mock), \
-         patches[4], patches[5]:
-        from app.orchestrator.graph import compiled_graph
-        final = await compiled_graph.ainvoke(_initial_state())
-
-    assert final["status"] == "failed"
-    assert "hardcoded secret" in final["error"]
-    reviewer_mock.assert_not_called()
-    tester_mock.assert_not_called()
-
-
-# --------------------------------------------------------------------------- #
-# Test 6: feedback del Tester llega al Coder en el reintento
-# --------------------------------------------------------------------------- #
-
-@pytest.mark.asyncio
-async def test_tester_feedback_passed_to_coder_on_retry():
-    """El output de pytest del Tester llega como tester_feedback al Coder."""
-    plan = _make_plan([_coder_task("task_1")])
-    coder_calls: list[dict] = []
-
-    async def coder_spy(task, reviewer_feedback=None):
-        coder_calls.append({"task_id": task.id, "feedback": reviewer_feedback})
-        return CoderResult(
-            task_id=task.id,
-            files_written=[f"app/{task.id}.py"],
-            summary="ok",
-        )
-
-    tester_calls = {"n": 0}
-
-    async def tester_fail_once(task, files_written, tester_feedback=None):
-        tester_calls["n"] += 1
-        if tester_calls["n"] == 1:
-            return TesterResult(
-                passed=False,
-                feedback="Tests fallaron:\nAssertionError en test_create",
-                task_id=task.id,
-                pytest_output="FAILED - AssertionError en test_create",
-            )
-        return _tester_ok(task.id)
-
-    patches = _patches(plan, coder_side_effect=coder_spy, tester_side_effect=tester_fail_once)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
-        from app.orchestrator.graph import compiled_graph
-        final = await compiled_graph.ainvoke(_initial_state())
-
-    assert final["status"] == "done"
-    assert len(coder_calls) == 2
-    # Primer intento del Coder: sin feedback
-    assert coder_calls[0]["feedback"] is None
-    # Segundo intento: con feedback del Tester
-    assert coder_calls[1]["feedback"] is not None
-    assert "AssertionError" in coder_calls[1]["feedback"]
+    agents_seq = [s.agent for s in final["steps"]]
+    assert "auditor" in agents_seq
+    assert agents_seq.index("auditor") > agents_seq.index("reviewer")

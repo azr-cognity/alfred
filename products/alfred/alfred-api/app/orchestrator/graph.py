@@ -1,28 +1,30 @@
 """
-Orquestador LangGraph — grafo compilado (S7).
+Orquestador LangGraph — grafo compilado (S8).
 
-Cambios respecto a S6:
-  - Nodo tester agregado después del reviewer.
-  - reviewer ahora emite reviewing_passed en lugar de dispatching cuando aprueba.
-  - Nuevo edge condicional: tester -> dispatcher | coder | END
+Cambios respecto a S7:
+  - Nodo auditor agregado como nodo terminal del run.
+  - dispatcher emite auditing cuando todas las tasks completan.
+  - route_after_dispatch incluye branch "auditor".
 
-Flujo:
-  START → architect → dispatcher → coder → opa_gate → reviewer ──┬──> tester ──┬──> dispatcher → END
-                          ↑                                       │             │
-                          └──────────── skip ◄────────────────────┘             └──> coder (reintento Tester)
-                                                                  └──> coder (reintento Reviewer)
+Flujo completo:
+  START → architect → dispatcher ──────────────────────────────> auditor → END
+                          ↑                                          ↑
+                          │   coder → opa_gate → reviewer → tester ─┘
+                          └── skip ◄──────────────────────────────────
 """
 
 from langgraph.graph import END, START, StateGraph
 
 from app.orchestrator.nodes import (
     architect_node,
+    auditor_node,
     coder_node,
     dispatcher_node,
     opa_gate_node,
     reviewer_node,
     tester_node,
     skip_node,
+    route_after_auditor,
     route_after_coder,
     route_after_dispatch,
     route_after_reviewer,
@@ -40,6 +42,7 @@ def build_graph() -> StateGraph:
     builder.add_node("opa_gate", opa_gate_node)
     builder.add_node("reviewer", reviewer_node)
     builder.add_node("tester", tester_node)
+    builder.add_node("auditor", auditor_node)
     builder.add_node("skip", skip_node)
 
     builder.add_edge(START, "architect")
@@ -53,6 +56,7 @@ def build_graph() -> StateGraph:
         {
             "coder": "coder",
             "skip": "skip",
+            "auditor": "auditor",
             END: END,
         },
     )
@@ -84,6 +88,12 @@ def build_graph() -> StateGraph:
             "coder": "coder",
             END: END,
         },
+    )
+
+    builder.add_conditional_edges(
+        "auditor",
+        route_after_auditor,
+        {END: END},
     )
 
     return builder
