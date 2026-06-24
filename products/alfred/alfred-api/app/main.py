@@ -1,8 +1,8 @@
 """
-Alfred API — entry point (S9).
+Alfred API — entry point (S11).
 
-Cambios respecto a S8:
-  - init_telemetry() en lifespan (Sentry + PostHog)
+Cambios respecto a S9:
+  - Router de proyectos agregado
 """
 
 import structlog
@@ -14,6 +14,7 @@ from app.core.database import init_db
 from app.core.telemetry import init_telemetry
 from app.api.routes.health import router as health_router
 from app.api.routes.runs import router as runs_router
+from app.api.routes.projects import router as projects_router
 
 logger = structlog.get_logger()
 
@@ -30,3 +31,4 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Alfred API", version="0.1.0", lifespan=lifespan)
 app.include_router(health_router)
 app.include_router(runs_router, prefix="/api/v1")
+app.include_router(projects_router, prefix="/api/v1")

@@ -1,17 +1,20 @@
 """
-Router de runs — versión S5.
+Router de runs — versión S11.
 
-POST /api/runs       → persiste run con status=queued, encola en Redis, 202
-GET  /api/runs/{id}/status → SSE: snapshot Postgres + tail del canal Redis
+POST /api/runs              → persiste run con status=queued, encola en Redis, 202
+GET  /api/runs              → lista de runs (filtro opcional project_id, paginación)
+GET  /api/runs/{id}         → detalle de un run
+GET  /api/runs/{id}/status  → SSE: snapshot Postgres + tail del canal Redis
 """
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
@@ -49,9 +52,9 @@ async def create_run(body: CreateRunRequest) -> RunResponse:
         await session.execute(
             text("""
                 INSERT INTO agent_runs
-                    (id, prompt, status, current_agent, created_at)
+                    (id, prompt, status, current_agent, created_at, project_id)
                 VALUES
-                    (:id, :prompt, :status, :agent, :created_at)
+                    (:id, :prompt, :status, :agent, :created_at, :project_id)
             """),
             {
                 "id": str(run_id),
@@ -59,6 +62,7 @@ async def create_run(body: CreateRunRequest) -> RunResponse:
                 "status": "queued",
                 "agent": None,
                 "created_at": created_at,
+                "project_id": str(body.project_id) if getattr(body, "project_id", None) else None,
             },
         )
         await session.commit()
@@ -83,6 +87,99 @@ async def create_run(body: CreateRunRequest) -> RunResponse:
         created_at=created_at,
         completed_at=None,
     )
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/runs  — lista paginada
+# --------------------------------------------------------------------------- #
+@router.get("/runs", tags=["Runs"])
+async def list_runs(
+    project_id: str | None = Query(default=None, description="Filtrar por proyecto"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """
+    Devuelve la lista de runs ordenados por created_at DESC.
+    Filtro opcional por project_id.
+    """
+    async with AsyncSessionLocal() as session:
+        if project_id:
+            rows = await session.execute(
+                text("""
+                    SELECT id, prompt, status, current_agent, plan, result,
+                           error, created_at, completed_at, project_id, duration_ms
+                    FROM agent_runs
+                    WHERE project_id = CAST(:project_id AS uuid)
+                    ORDER BY created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """),
+                {"project_id": project_id, "limit": limit, "offset": offset},
+            )
+        else:
+            rows = await session.execute(
+                text("""
+                    SELECT id, prompt, status, current_agent, plan, result,
+                           error, created_at, completed_at, project_id, duration_ms
+                    FROM agent_runs
+                    ORDER BY created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """),
+                {"limit": limit, "offset": offset},
+            )
+
+        runs = [dict(r) for r in rows.mappings()]
+
+        # Total para paginación
+        if project_id:
+            count_row = await session.execute(
+                text("SELECT COUNT(*) FROM agent_runs WHERE project_id = CAST(:project_id AS uuid)"),
+                {"project_id": project_id},
+            )
+        else:
+            count_row = await session.execute(text("SELECT COUNT(*) FROM agent_runs"))
+
+        total = count_row.scalar()
+
+    # Serializar UUIDs y fechas
+    for r in runs:
+        r["id"] = str(r["id"])
+        r["project_id"] = str(r["project_id"]) if r.get("project_id") else None
+        r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
+        r["completed_at"] = r["completed_at"].isoformat() if r.get("completed_at") else None
+
+    return {"runs": runs, "total": total, "limit": limit, "offset": offset}
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/runs/{run_id}  — detalle
+# --------------------------------------------------------------------------- #
+@router.get("/runs/{run_id}", tags=["Runs"])
+async def get_run(run_id: str) -> dict:
+    """
+    Devuelve el detalle completo de un run, incluyendo plan y result (jsonb).
+    """
+    async with AsyncSessionLocal() as session:
+        row = await session.execute(
+            text("""
+                SELECT id, prompt, status, current_agent, plan, result,
+                       error, created_at, completed_at, project_id, duration_ms, tokens_used
+                FROM agent_runs
+                WHERE id = CAST(:id AS uuid)
+            """),
+            {"id": run_id},
+        )
+        run = row.mappings().first()
+
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' no encontrado")
+
+    data = dict(run)
+    data["id"] = str(data["id"])
+    data["project_id"] = str(data["project_id"]) if data.get("project_id") else None
+    data["created_at"] = data["created_at"].isoformat() if data.get("created_at") else None
+    data["completed_at"] = data["completed_at"].isoformat() if data.get("completed_at") else None
+
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -117,7 +214,7 @@ async def _sse_generator(run_id: str):
     # ── Snapshot inicial desde Postgres ────────────────────────────────────────
     async with AsyncSessionLocal() as session:
         row = await session.execute(
-            text("SELECT status, current_agent, error FROM agent_runs WHERE id = :id"),
+            text("SELECT status, current_agent, error FROM agent_runs WHERE id = CAST(:id AS uuid)"),
             {"id": run_id},
         )
         run = row.mappings().first()
@@ -144,16 +241,18 @@ async def _sse_generator(run_id: str):
     pubsub = r.pubsub()
     await pubsub.subscribe(f"run:{run_id}")
 
-    import asyncio
     try:
         while True:
             # Heartbeat: comentario SSE vacío para mantener conexión
             yield ": heartbeat\n\n"
 
             try:
-                msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=15.0)
+                msg = await asyncio.wait_for(
+                    pubsub.get_message(ignore_subscribe_messages=True),
+                    timeout=15.0,
+                )
             except asyncio.TimeoutError:
-                continue  # solo heartbeat, seguir esperando
+                continue
 
             if msg is None:
                 continue

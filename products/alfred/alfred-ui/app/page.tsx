@@ -5,7 +5,8 @@ import { PipelineView } from "@/components/PipelineView";
 import { CodeViewer } from "@/components/CodeViewer";
 import { RunSidebar } from "@/components/RunSidebar";
 import { AgentStep, NodeUpdate, Run } from "@/lib/types";
-import { createRun, getRuns, subscribeToRun } from "@/lib/api";
+import { createRun, getRun, getRuns, getProjects, Project } from "@/lib/api";
+import { subscribeToRun } from "@/lib/api";
 
 export default function Home() {
   const [runs, setRuns] = useState<Pick<Run, "id" | "prompt" | "status" | "created_at">[]>([]);
@@ -16,14 +17,105 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [runStatus, setRunStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
 
-  // Archivos escritos — tomar el último step con files_written para Monaco
+  // Archivos escritos — código real desde result jsonb o placeholder
+  const [codeContent, setCodeContent] = useState<string | null>(null);
+  const [codeFilename, setCodeFilename] = useState<string | null>(null);
+
   const lastFilesStep = [...steps]
     .reverse()
     .find(s => s.files_written?.length > 0 && s.agent === "coder");
 
+  // Cargar proyectos al montar
   useEffect(() => {
-    getRuns().then(setRuns).catch(() => {});
+    getProjects().then(setProjects).catch(() => {});
+  }, []);
+
+  // Cargar runs al montar y cuando cambia el proyecto activo
+  useEffect(() => {
+    getRuns(activeProjectId).then(setRuns).catch(() => {});
+  }, [activeProjectId]);
+
+  // Cargar detalle de run al seleccionar uno del sidebar
+  const handleSelectRun = useCallback(async (id: string) => {
+    setActiveRunId(id);
+    setSteps([]);
+    setActiveNode(null);
+    setCurrentTaskId(null);
+    setError(null);
+    setCodeContent(null);
+    setCodeFilename(null);
+
+    const run = await getRun(id).catch(() => null);
+    if (!run) return;
+
+    setRunStatus(run.status);
+
+    // Extraer archivos desde result jsonb si existen
+    if (run.result && typeof run.result === "object") {
+      const result = run.result as Record<string, unknown>;
+      const files = result.files_written as Record<string, string> | undefined;
+      if (files) {
+        const firstPath = Object.keys(files)[0];
+        if (firstPath) {
+          setCodeFilename(firstPath);
+          setCodeContent(files[firstPath]);
+        }
+      }
+    }
+
+    // Si el run sigue activo, suscribirse al SSE
+    if (!["done", "failed"].includes(run.status)) {
+      setLoading(true);
+      subscribeToRun(
+        id,
+        (update: NodeUpdate) => {
+          if (update.node) setActiveNode(update.node);
+          if (update.current_task_id) setCurrentTaskId(update.current_task_id);
+          if (update.status) setRunStatus(update.status);
+
+          if (update.event === "run_finished") {
+            setActiveNode(null);
+            setLoading(false);
+            setRunStatus(update.status ?? null);
+            if (update.error) setError(update.error);
+            setRuns(prev => prev.map(r =>
+              r.id === id ? { ...r, status: (update.status ?? "done") as Run["status"] } : r
+            ));
+            // Recargar detalle para obtener archivos
+            getRun(id).then(updated => {
+              if (!updated?.result) return;
+              const result = updated.result as Record<string, unknown>;
+              const files = result.files_written as Record<string, string> | undefined;
+              if (files) {
+                const firstPath = Object.keys(files)[0];
+                if (firstPath) {
+                  setCodeFilename(firstPath);
+                  setCodeContent(files[firstPath]);
+                }
+              }
+            }).catch(() => {});
+          }
+        },
+        () => {
+          setLoading(false);
+          setActiveNode(null);
+        }
+      );
+    }
+  }, []);
+
+  const handleNew = useCallback(() => {
+    setActiveRunId(null);
+    setSteps([]);
+    setActiveNode(null);
+    setCurrentTaskId(null);
+    setRunStatus(null);
+    setError(null);
+    setCodeContent(null);
+    setCodeFilename(null);
   }, []);
 
   const handleRun = useCallback(async (prompt: string) => {
@@ -33,11 +125,16 @@ export default function Home() {
     setCurrentTaskId(null);
     setRunStatus("queued");
     setError(null);
+    setCodeContent(null);
+    setCodeFilename(null);
 
     try {
-      const { id } = await createRun(prompt);
+      const { id } = await createRun(prompt, activeProjectId);
       setActiveRunId(id);
-      setRuns(prev => [{ id, prompt, status: "running", created_at: new Date().toISOString() }, ...prev]);
+      setRuns(prev => [
+        { id, prompt, status: "running", created_at: new Date().toISOString() },
+        ...prev,
+      ]);
 
       const unsub = subscribeToRun(
         id,
@@ -54,6 +151,19 @@ export default function Home() {
             setRuns(prev => prev.map(r =>
               r.id === id ? { ...r, status: (update.status ?? "done") as Run["status"] } : r
             ));
+            // Recargar detalle para obtener archivos generados
+            getRun(id).then(updated => {
+              if (!updated?.result) return;
+              const result = updated.result as Record<string, unknown>;
+              const files = result.files_written as Record<string, string> | undefined;
+              if (files) {
+                const firstPath = Object.keys(files)[0];
+                if (firstPath) {
+                  setCodeFilename(firstPath);
+                  setCodeContent(files[firstPath]);
+                }
+              }
+            }).catch(() => {});
           }
         },
         () => {
@@ -68,23 +178,27 @@ export default function Home() {
       setError(e instanceof Error ? e.message : "Error al crear el run");
       setRunStatus("failed");
     }
-  }, []);
+  }, [activeProjectId]);
+
+  const showCode = codeContent ?? (lastFilesStep
+    ? "# Los archivos generados aparecen aquí\n# Ejecuta un run para ver el código real"
+    : null);
+  const showFilename = codeFilename ?? lastFilesStep?.files_written[0] ?? null;
 
   return (
     <div style={{ display: "flex", height: "100vh", background: "var(--bg)" }}>
       <RunSidebar
         runs={runs}
         activeId={activeRunId}
-        onSelect={setActiveRunId}
+        onSelect={handleSelectRun}
+        onNew={handleNew}
+        projects={projects}
+        activeProjectId={activeProjectId}
+        onProjectChange={setActiveProjectId}
       />
 
       {/* Main canvas */}
-      <div style={{
-        flex: 1,
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
-      }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         {/* Header */}
         <div style={{
           padding: "14px 24px",
@@ -105,7 +219,11 @@ export default function Home() {
                     padding: "2px 8px",
                     borderRadius: 4,
                     background: "var(--surface-2)",
-                    color: runStatus === "done" ? "var(--success)" : runStatus === "failed" ? "var(--error)" : "var(--running)",
+                    color: runStatus === "done"
+                      ? "var(--success)"
+                      : runStatus === "failed"
+                        ? "var(--error)"
+                        : "var(--running)",
                     fontWeight: 600,
                     textTransform: "uppercase",
                     letterSpacing: "0.05em",
@@ -167,11 +285,11 @@ export default function Home() {
             </div>
           )}
 
-          {lastFilesStep && (
+          {showCode && showFilename && (
             <CodeViewer
-              code={"# Los archivos generados aparecen aquí\n# Conecta el backend para ver el código real"}
-              language="python"
-              filename={lastFilesStep.files_written[0]}
+              code={showCode}
+              language={showFilename.endsWith(".ts") || showFilename.endsWith(".tsx") ? "typescript" : "python"}
+              filename={showFilename}
             />
           )}
 

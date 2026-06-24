@@ -1,10 +1,15 @@
 "use client";
 import { Run, STATUS_COLOR } from "@/lib/types";
+import { Project } from "@/lib/api";
 
 interface Props {
   runs: Pick<Run, "id" | "prompt" | "status" | "created_at">[];
   activeId: string | null;
   onSelect: (id: string) => void;
+  onNew: () => void;
+  projects: Project[];
+  activeProjectId: string | null;
+  onProjectChange: (id: string | null) => void;
 }
 
 function timeAgo(dateStr: string): string {
@@ -17,7 +22,15 @@ function timeAgo(dateStr: string): string {
   return `${Math.floor(h / 24)}d`;
 }
 
-export function RunSidebar({ runs, activeId, onSelect }: Props) {
+export function RunSidebar({
+  runs,
+  activeId,
+  onSelect,
+  onNew,
+  projects,
+  activeProjectId,
+  onProjectChange,
+}: Props) {
   return (
     <div style={{
       width: 220,
@@ -28,10 +41,13 @@ export function RunSidebar({ runs, activeId, onSelect }: Props) {
       height: "100vh",
       overflowY: "auto",
     }}>
-      {/* Logo */}
+      {/* Logo + botón nuevo */}
       <div style={{
-        padding: "18px 16px 14px",
+        padding: "14px 16px",
         borderBottom: "1px solid var(--border)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
       }}>
         <span style={{
           fontSize: 17,
@@ -39,10 +55,61 @@ export function RunSidebar({ runs, activeId, onSelect }: Props) {
           letterSpacing: "-0.02em",
           color: "var(--text)",
         }}>
-          alfred
-          <span style={{ color: "var(--accent)" }}>.</span>
+          alfred<span style={{ color: "var(--accent)" }}>.</span>
         </span>
+        <button
+          onClick={onNew}
+          title="Nuevo run"
+          style={{
+            background: "var(--surface-2)",
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            color: "var(--text-muted)",
+            cursor: "pointer",
+            fontSize: 16,
+            lineHeight: 1,
+            padding: "3px 7px",
+          }}
+        >
+          +
+        </button>
       </div>
+
+      {/* Selector de proyecto */}
+      {projects.length > 0 && (
+        <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)" }}>
+          <p style={{
+            fontSize: 11,
+            color: "var(--text-muted)",
+            textTransform: "uppercase",
+            letterSpacing: "0.06em",
+            fontWeight: 600,
+            marginBottom: 6,
+          }}>
+            Proyecto
+          </p>
+          <select
+            value={activeProjectId ?? ""}
+            onChange={e => onProjectChange(e.target.value || null)}
+            style={{
+              width: "100%",
+              background: "var(--surface-2)",
+              border: "1px solid var(--border)",
+              borderRadius: 6,
+              color: "var(--text)",
+              fontSize: 12,
+              padding: "5px 8px",
+              cursor: "pointer",
+              outline: "none",
+            }}
+          >
+            <option value="">Todos</option>
+            {projects.map(p => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {/* Runs list */}
       <div style={{ padding: "8px 0", flex: 1 }}>
@@ -79,11 +146,7 @@ export function RunSidebar({ runs, activeId, onSelect }: Props) {
             }}
           >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span style={{
-                fontSize: 11,
-                fontFamily: "monospace",
-                color: "var(--text-muted)",
-              }}>
+              <span style={{ fontSize: 11, fontFamily: "monospace", color: "var(--text-muted)" }}>
                 {run.id.slice(0, 8)}
               </span>
               <span style={{
