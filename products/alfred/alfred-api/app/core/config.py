@@ -36,10 +36,15 @@ class Settings(BaseSettings):
     alfred_project_root: str = "C:/Cognity/products/alfred/alfred-api"
 
     # ── GitHub ─────────────────────────────────────────────────────────────────
-    github_token: str = ""          # Personal Access Token con permisos repo
-    github_repo: str = "azr-cognity/alfred"  # owner/repo
-    github_base_branch: str = "main"         # branch destino de las PRs
+    github_token: str = ""
+    github_repo: str = "azr-cognity/alfred"
+    github_base_branch: str = "main"
+
+    # ── Observabilidad (S9) ────────────────────────────────────────────────────
+    sentry_dsn: str = ""           # dejar vacío para deshabilitar
+    posthog_api_key: str = ""      # dejar vacío para deshabilitar
+    posthog_host: str = "https://app.posthog.com"
 
 
-# Instancia global — importar desde aquí en todo el proyecto
+# Instancia global
 settings = Settings()

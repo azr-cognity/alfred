@@ -1,7 +1,11 @@
 """
-Alfred Worker — Paso 3 del orquestador S5.
-Fix S6: elimina ainvoke duplicado al final del astream.
-Fix S6: reconnect Redis silencioso.
+Alfred Worker (S9).
+
+Cambios respecto a S8:
+  - init_telemetry() al arrancar
+  - track_event en run start/done/failed
+  - Exponential backoff en reconnect Redis (1s → 2s → 4s → max 30s)
+  - capture_exception en errores no manejados
 """
 
 import asyncio
@@ -15,6 +19,7 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.core.telemetry import capture_exception, init_telemetry, track_event
 from app.orchestrator.graph import compiled_graph
 from app.orchestrator.state import AgentStep, initial_state
 
@@ -24,6 +29,11 @@ STREAM_KEY = "alfred:runs"
 GROUP_NAME = "alfred-workers"
 CONSUMER_NAME = f"worker-{uuid.uuid4().hex[:8]}"
 BLOCK_MS = 2000
+
+# Exponential backoff config
+_BACKOFF_BASE = 1      # segundos
+_BACKOFF_MAX = 30      # segundos máximo
+_backoff_current = _BACKOFF_BASE
 
 
 def _redis() -> aioredis.Redis:
@@ -94,16 +104,17 @@ async def _execute_run(r: aioredis.Redis, run_id: str, prompt: str) -> None:
     log = logger.bind(run_id=run_id)
     log.info("worker.run.start")
 
+    track_event("run.started", {"run_id": run_id, "prompt_len": len(prompt)})
+
     await _update_run_status(run_id, "running")
     await _publish(r, run_id, {"event": "run_started", "run_id": run_id})
 
     state = initial_state(run_id=run_id, prompt=prompt)
     seen_steps: set[str] = set()
-
-    # Acumula status/error del último nodo que los emita —
-    # SIN reinvocar el grafo al final (eso relanzaba todo el pipeline).
     final_status = "done"
     final_error: str | None = None
+    step_count = 0
+    started_at = datetime.now(timezone.utc)
 
     try:
         async for event in compiled_graph.astream(state):
@@ -127,7 +138,10 @@ async def _execute_run(r: aioredis.Redis, run_id: str, prompt: str) -> None:
                 if key not in seen_steps:
                     seen_steps.add(key)
                     await _insert_step(run_id, step)
+                    step_count += 1
                     log.info("worker.step.saved", task_id=step.task_id, status=step.status)
+
+        duration_s = (datetime.now(timezone.utc) - started_at).total_seconds()
 
         await _update_run_status(run_id, final_status, final_error)
         await _publish(r, run_id, {
@@ -136,10 +150,22 @@ async def _execute_run(r: aioredis.Redis, run_id: str, prompt: str) -> None:
             "status": final_status,
             "error": final_error,
         })
-        log.info("worker.run.done", status=final_status)
+
+        event_name = "run.completed" if final_status == "done" else "run.failed"
+        track_event(event_name, {
+            "run_id": run_id,
+            "status": final_status,
+            "steps": step_count,
+            "duration_s": round(duration_s, 1),
+            "error": final_error,
+        })
+
+        log.info("worker.run.done", status=final_status, steps=step_count, duration_s=round(duration_s, 1))
 
     except Exception as e:
         log.error("worker.run.error", error=str(e))
+        capture_exception(e)
+        track_event("run.failed", {"run_id": run_id, "error": str(e), "exception": True})
         await _update_run_status(run_id, "failed", str(e))
         await _publish(r, run_id, {
             "event": "run_finished",
@@ -150,6 +176,10 @@ async def _execute_run(r: aioredis.Redis, run_id: str, prompt: str) -> None:
 
 
 async def main() -> None:
+    global _backoff_current
+
+    init_telemetry()
+
     log = logger.bind(consumer=CONSUMER_NAME)
     log.info("worker.start", stream=STREAM_KEY, group=GROUP_NAME)
 
@@ -166,6 +196,9 @@ async def main() -> None:
                 count=1,
                 block=BLOCK_MS,
             )
+
+            # Reconexión exitosa — resetear backoff
+            _backoff_current = _BACKOFF_BASE
 
             if not results:
                 continue
@@ -184,6 +217,7 @@ async def main() -> None:
                         await _execute_run(r, run_id, prompt)
                     except Exception as e:
                         log.error("worker.execute_error", run_id=run_id, error=str(e))
+                        capture_exception(e)
                     finally:
                         await r.xack(STREAM_KEY, GROUP_NAME, msg_id)
                         log.info("worker.ack", msg_id=msg_id)
@@ -192,12 +226,15 @@ async def main() -> None:
             break
 
         except (aioredis.ConnectionError, aioredis.TimeoutError):
-            log.debug("worker.reconnecting")
-            await asyncio.sleep(1)
+            log.warning("worker.reconnecting", backoff_s=_backoff_current)
+            await asyncio.sleep(_backoff_current)
+            _backoff_current = min(_backoff_current * 2, _BACKOFF_MAX)
 
         except Exception as e:
             log.error("worker.loop_error", error=str(e))
-            await asyncio.sleep(2)
+            capture_exception(e)
+            await asyncio.sleep(_backoff_current)
+            _backoff_current = min(_backoff_current * 2, _BACKOFF_MAX)
 
     await r.aclose()
     log.info("worker.stopped")
