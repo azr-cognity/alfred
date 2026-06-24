@@ -1,23 +1,10 @@
 """
-Agente Coder — el implementador de Alfred (S7).
+Agente Coder — el implementador de Alfred (S12).
 
-Cambios respecto a S6:
-  - run_coder acepta reviewer_feedback: str | None = None
-  - Si hay feedback, se agrega al user_prompt como sección de corrección
-    para que el Coder entienda qué rechazó el Reviewer en el intento anterior.
-
-Responsabilidad:
-  Recibe una tarea del plan del Architect y genera el código correspondiente.
-  Usa búsqueda semántica para entender las convenciones del proyecto antes
-  de escribir una sola línea.
-
-Flujo:
-  1. Recibe la tarea (Task) del Architect
-  2. Busca archivos relevantes en el codebase (search_codebase)
-  3. Lee los archivos más relevantes para entender convenciones (read_file)
-  4. Genera el código con el modelo local
-  5. Escribe los archivos (write_file)
-  6. Retorna un CoderResult con los archivos creados/modificados
+Cambios respecto a S7:
+  - Lee CONVENTIONS.md automáticamente antes de generar código.
+    Este archivo define los patrones correctos de SQLModel, asyncpg,
+    Pydantic v2 y FastAPI que el modelo debe seguir.
 """
 
 import json
@@ -35,6 +22,7 @@ logger = structlog.get_logger()
 
 MAX_RETRIES = 3
 
+CONVENTIONS_PATH = "CONVENTIONS.md"
 
 SYSTEM_PROMPT = """Eres el Coder de Alfred, un experto en desarrollo de software.
 
@@ -43,9 +31,11 @@ codebase existente del proyecto.
 
 ## Proceso de trabajo
 1. Analiza la tarea recibida
-2. Revisa el contexto del codebase proporcionado
-3. Genera código completo (no snippets, no ejemplos parciales)
-4. Asegúrate de que el código sea coherente con las convenciones existentes
+2. Revisa el archivo CONVENTIONS.md — sus reglas son obligatorias y tienen
+   prioridad sobre cualquier preferencia del modelo
+3. Revisa el contexto del codebase proporcionado
+4. Genera código completo (no snippets, no ejemplos parciales)
+5. Asegúrate de que el código sea coherente con las convenciones existentes
 
 ## Stack del proyecto
 - Backend: FastAPI (Python 3.11) + SQLModel + Pydantic v2
@@ -57,8 +47,11 @@ codebase existente del proyecto.
 - Archivos de máximo 300 líneas
 - Siempre usar type hints
 - Nunca usar print() — usar structlog
-- Los endpoints FastAPI siempre tienen response_model
+- Los endpoints FastAPI siempre tienen tags y docstring
 - Todo código tiene docstring
+- UUIDs siempre serializados como str()
+- Fechas siempre con timezone=True en columnas SQLAlchemy
+- CAST(:param AS type) en queries — nunca :param::type (ADR-007)
 
 ## Formato de respuesta
 Responde con un JSON que contenga los archivos a crear o modificar:
@@ -124,11 +117,19 @@ async def run_coder(
     is_retry = reviewer_feedback is not None
     log.info("coder.start", is_retry=is_retry)
 
-    # ── Paso 1: Buscar contexto relevante ─────────────────────────────────────
+    # ── Paso 1: Leer CONVENTIONS.md ───────────────────────────────────────────
+    conventions = await read_file(CONVENTIONS_PATH)
+    if conventions.startswith("ERROR"):
+        log.warning("coder.conventions_not_found", path=CONVENTIONS_PATH)
+        conventions = "# Sin convenciones disponibles"
+    else:
+        log.info("coder.conventions_loaded", size=len(conventions))
+
+    # ── Paso 2: Buscar contexto relevante ─────────────────────────────────────
     search_query = f"{task.title} {task.description}"
     relevant_files = await search_codebase(search_query, limit=5)
 
-    # ── Paso 2: Leer archivos más relevantes ──────────────────────────────────
+    # ── Paso 3: Leer archivos más relevantes ──────────────────────────────────
     context_parts = []
 
     all_files = await list_files("app")
@@ -146,8 +147,13 @@ async def run_coder(
 
     context = "\n\n".join(context_parts)
 
-    # ── Paso 3: Construir prompt ───────────────────────────────────────────────
-    user_prompt = f"""## Tarea a implementar
+    # ── Paso 4: Construir prompt ───────────────────────────────────────────────
+    user_prompt = f"""## Convenciones obligatorias del proyecto
+{conventions}
+
+---
+
+## Tarea a implementar
 ID: {task.id}
 Título: {task.title}
 Descripción: {task.description}
@@ -158,10 +164,9 @@ Complejidad estimada: {task.estimated_complexity}
 ## Contexto del codebase
 {context}
 
-Implementa la tarea completa siguiendo las convenciones del proyecto.
+Implementa la tarea completa siguiendo ESTRICTAMENTE las convenciones del proyecto.
 """
 
-    # S7: inyectar feedback del Reviewer si es un reintento
     if reviewer_feedback:
         user_prompt += f"""
 ## CORRECCIÓN REQUERIDA
@@ -170,10 +175,11 @@ El Reviewer rechazó tu implementación anterior con el siguiente feedback:
 {reviewer_feedback}
 
 Corrige específicamente el problema señalado. Mantén todo lo que estaba correcto
-y enfócate en resolver lo indicado arriba.
+y enfócate en resolver lo indicado arriba. Revisa las convenciones si el error
+está relacionado con SQLModel, asyncpg, imports o tipos de datos.
 """
 
-    # ── Paso 4: Generar código ─────────────────────────────────────────────────
+    # ── Paso 5: Generar código ─────────────────────────────────────────────────
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         log.info("coder.attempt", attempt=attempt)
@@ -194,7 +200,7 @@ y enfócate en resolver lo indicado arriba.
             if not files:
                 raise ValueError("El modelo no generó ningún archivo")
 
-            # ── Paso 5: Escribir archivos ──────────────────────────────────────
+            # ── Paso 6: Escribir archivos ──────────────────────────────────────
             files_written = []
             for file_info in files:
                 path = file_info.get("path", "")
