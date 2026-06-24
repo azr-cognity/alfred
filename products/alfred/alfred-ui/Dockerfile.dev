@@ -1,0 +1,15 @@
+# alfred-ui/Dockerfile.dev
+# Hot reload via volumen — solo para desarrollo local.
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Instalar dependencias primero (capa cacheada)
+COPY package*.json ./
+RUN npm install
+
+# El código se monta como volumen en docker-compose
+# para que los cambios se reflejen sin rebuild.
+EXPOSE 3000
+
+CMD ["npm", "run", "dev"]
