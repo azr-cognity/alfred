@@ -2,8 +2,11 @@
 Orquestador LangGraph — estado del grafo (S7).
 
 Cambios respecto a S6:
-  - retry_counts: dict[str, int]  — contador de reintentos por task_id
-  - reviewer_feedback: Optional[str]  — feedback del último rechazo para pasar al Coder
+  - retry_counts: dict[str, int]  — contador de reintentos Reviewer por task_id
+  - reviewer_feedback: Optional[str]  — feedback del último rechazo del Reviewer
+  - tester_retry_counts: dict[str, int]  — contador de reintentos Tester por task_id
+  - tester_feedback: Optional[str]  — feedback del último fallo del Tester
+  - initial_state(): función helper que el worker usa para arrancar el grafo
 """
 
 import operator
@@ -14,6 +17,7 @@ from pydantic import BaseModel
 from app.schemas.runs import Plan, RunStatus
 
 MAX_REVIEWER_RETRIES = 2
+MAX_TESTER_RETRIES = 2
 
 
 class DagError(Exception):
@@ -35,13 +39,15 @@ class GraphState(dict):
     """Estado compartido del grafo LangGraph.
 
     Campos acumulativos (Annotated con operator.add):
-      - completed: lista de task_ids aprobados por el Reviewer
+      - completed: lista de task_ids completados
       - steps: historial de pasos de cada agente
 
     Campos escalares (reemplazados en cada update):
       - run_id, prompt, plan, current_task_id, status, error
-      - retry_counts: dict task_id -> nº de reintentos usados por el Reviewer
-      - reviewer_feedback: feedback del último rechazo (None si no aplica)
+      - retry_counts: dict task_id -> nº de reintentos del Reviewer
+      - reviewer_feedback: feedback del último rechazo del Reviewer
+      - tester_retry_counts: dict task_id -> nº de reintentos del Tester
+      - tester_feedback: output del último fallo del Tester
     """
 
     run_id: str
@@ -52,8 +58,36 @@ class GraphState(dict):
     steps: Annotated[list[AgentStep], operator.add]
     status: RunStatus
     error: Optional[str]
-    retry_counts: dict  # task_id -> int
+    retry_counts: dict         # task_id -> int (Reviewer)
     reviewer_feedback: Optional[str]
+    tester_retry_counts: dict  # task_id -> int (Tester)
+    tester_feedback: Optional[str]
+
+
+def initial_state(run_id: str, prompt: str) -> dict:
+    """Construye el estado inicial del grafo para un nuevo run.
+
+    Args:
+        run_id: ID del run (UUID generado por la API)
+        prompt: prompt del usuario
+
+    Returns:
+        dict compatible con GraphState para pasar a compiled_graph.astream()
+    """
+    return {
+        "run_id": run_id,
+        "prompt": prompt,
+        "plan": None,
+        "current_task_id": None,
+        "completed": [],
+        "steps": [],
+        "status": "queued",
+        "error": None,
+        "retry_counts": {},
+        "reviewer_feedback": None,
+        "tester_retry_counts": {},
+        "tester_feedback": None,
+    }
 
 
 # --------------------------------------------------------------------------- #
