@@ -1,16 +1,18 @@
 """
 Agente Coder — el implementador de Alfred (S12).
 
-Cambios respecto a S7:
-  - Lee CONVENTIONS.md automáticamente antes de generar código.
-    Este archivo define los patrones correctos de SQLModel, asyncpg,
-    Pydantic v2 y FastAPI que el modelo debe seguir.
+Cambios respecto a S11:
+  - _parse_response() reemplaza _extract_json(): intenta json.loads normal,
+    luego json-repair como fallback para docstrings Python no escapados (triple-comilla).
+  - Raw log en coder.parse_error para diagnóstico del output real del modelo.
+  - SYSTEM_PROMPT reforzado: regla explícita de escaping de triple-comilla.
 """
 
 import json
 import re
 
 import structlog
+from json_repair import repair_json
 
 from app.core.config import settings
 from app.core.ollama import ollama
@@ -53,6 +55,16 @@ codebase existente del proyecto.
 - Fechas siempre con timezone=True en columnas SQLAlchemy
 - CAST(:param AS type) en queries — nunca :param::type (ADR-007)
 
+## REGLA CRÍTICA DE FORMATO JSON
+El campo "content" de cada archivo es un string JSON. Las triples comillas
+Python DEBEN estar escapadas como \\\"\\\"\\\" (barra-barra-barra-comilla x3).
+
+CORRECTO   → "content": "def foo():\\n    \\\"\\\"\\\"Docstring.\\\"\\\"\\\"\\n    pass"
+INCORRECTO → "content": "def foo():\\n    \"\"\"Docstring.\"\"\"\\n    pass"
+
+Si no escapas las triples comillas el JSON es inválido. El parser rechazará
+la respuesta y tendrás que reintentar. Escapa SIEMPRE.
+
 ## Formato de respuesta
 Responde con un JSON que contenga los archivos a crear o modificar:
 
@@ -67,7 +79,7 @@ Responde con un JSON que contenga los archivos a crear o modificar:
   "summary": "qué se implementó y por qué se tomaron estas decisiones"
 }
 
-Responde ÚNICAMENTE con el JSON. Sin texto adicional, sin markdown.
+Responde ÚNICAMENTE con el JSON. Sin texto adicional, sin markdown, sin <think>.
 """
 
 
@@ -86,36 +98,97 @@ class CoderResult:
         self.success = len(files_written) > 0
 
 
-def _extract_json(text: str) -> str:
-    """Extrae JSON de la respuesta del modelo."""
-    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if match:
-        return match.group(1).strip()
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        return match.group(0).strip()
-    return text.strip()
+def _parse_response(raw: str, log: structlog.BoundLogger) -> dict:
+    """Extrae y parsea el JSON de la respuesta del modelo.
+
+    Estrategia en tres capas:
+    1. Limpiar <think> y extraer bloque JSON/código
+    2. json.loads() directo — happy path
+    3. json_repair() — fallback para triple-comillas no escapadas y otros
+       errores comunes que el modelo introduce en el campo "content"
+
+    Args:
+        raw: texto crudo devuelto por ollama.generate()
+        log: logger con contexto ya bindeado (agent, task_id, attempt)
+
+    Returns:
+        dict con al menos las claves "files" y "summary"
+
+    Raises:
+        json.JSONDecodeError: si ni json.loads ni json_repair logran parsear
+    """
+    # Capa 1: limpiar thinking tags y extraer bloque
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
+
+    # Intentar extraer bloque ```json ... ``` primero
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+    candidate = match.group(1).strip() if match else cleaned
+
+    # Si no tiene llaves, buscar el objeto JSON directamente
+    if not candidate.startswith("{"):
+        match = re.search(r"\{[\s\S]*\}", candidate)
+        candidate = match.group(0).strip() if match else candidate
+
+    # Capa 2: parse directo
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as direct_err:
+        log.warning(
+            "coder.json_loads_failed",
+            error=str(direct_err),
+            raw_snippet=candidate[:300],  # primeros 300 chars para diagnóstico
+        )
+
+    # Capa 3: json-repair fallback
+    try:
+        repaired = repair_json(candidate, return_objects=True)
+        if isinstance(repaired, dict):
+            log.info("coder.json_repair_success")
+            return repaired
+        # repair_json devolvió algo que no es dict — error real
+        raise json.JSONDecodeError(
+            f"json_repair devolvió {type(repaired).__name__}, se esperaba dict",
+            candidate,
+            0,
+        )
+    except Exception as repair_err:
+        log.error(
+            "coder.json_repair_failed",
+            error=str(repair_err),
+            raw_full=raw[:800],  # más contexto para el caso extremo
+        )
+        # Re-lanzar el error original de json.loads para mantener el tipo
+        raise json.JSONDecodeError(
+            f"Parse fallido con json.loads y json_repair: {repair_err}",
+            candidate,
+            0,
+        ) from repair_err
 
 
 async def run_coder(
     task: Task,
+    run_context: str = "",
     reviewer_feedback: str | None = None,
 ) -> CoderResult:
-    """
-    Ejecuta el agente Coder para una tarea específica.
+    """Ejecuta el agente Coder para una tarea específica.
 
     Args:
-        task: la tarea del plan del Architect
+        task: la tarea del plan del Architect.
+        run_context: contexto del repo construido por build_run_context_node.
+                     Si es "" (vacío), hace búsqueda pgvector propia (fallback).
         reviewer_feedback: feedback del Reviewer si esta es una corrección
-                           (None en el primer intento)
+                           (None en el primer intento).
 
     Returns:
-        CoderResult con los archivos escritos y el resumen
+        CoderResult con los archivos escritos y el resumen.
+
+    Raises:
+        ValueError: si el Coder no logra generar código válido tras MAX_RETRIES.
     """
     log = logger.bind(agent="coder", task_id=task.id, task=task.title)
     is_retry = reviewer_feedback is not None
-    log.info("coder.start", is_retry=is_retry)
+    has_run_context = bool(run_context.strip())
+    log.info("coder.start", is_retry=is_retry, has_run_context=has_run_context)
 
     # ── Paso 1: Leer CONVENTIONS.md ───────────────────────────────────────────
     conventions = await read_file(CONVENTIONS_PATH)
@@ -125,29 +198,33 @@ async def run_coder(
     else:
         log.info("coder.conventions_loaded", size=len(conventions))
 
-    # ── Paso 2: Buscar contexto relevante ─────────────────────────────────────
-    search_query = f"{task.title} {task.description}"
-    relevant_files = await search_codebase(search_query, limit=5)
-
-    # ── Paso 3: Leer archivos más relevantes ──────────────────────────────────
+    # ── Paso 2: Contexto del repo ──────────────────────────────────────────────
     context_parts = []
-
     all_files = await list_files("app")
     context_parts.append(f"## Estructura del proyecto\n{chr(10).join(all_files)}")
 
-    for result in relevant_files[:3]:
-        if result["similarity"] > 0.3:
-            content = await read_file(result["file_path"])
-            if not content.startswith("ERROR"):
-                context_parts.append(
-                    f"## Archivo existente: {result['file_path']}\n"
-                    f"(similitud: {result['similarity']})\n"
-                    f"```python\n{content[:1500]}\n```"
-                )
+    if has_run_context:
+        context_parts.append("## Contexto del repositorio (archivos relevantes)")
+        context_parts.append(run_context)
+        log.info("coder.context_from_run", context_chars=len(run_context))
+    else:
+        search_query = f"{task.title} {task.description}"
+        relevant_files = await search_codebase(search_query, limit=5)
+        log.info("coder.context_from_search", results=len(relevant_files))
+
+        for result in relevant_files[:3]:
+            if result["similarity"] > 0.3:
+                content = await read_file(result["file_path"])
+                if not content.startswith("ERROR"):
+                    context_parts.append(
+                        f"## Archivo existente: {result['file_path']}\n"
+                        f"(similitud: {result['similarity']})\n"
+                        f"```python\n{content[:1500]}\n```"
+                    )
 
     context = "\n\n".join(context_parts)
 
-    # ── Paso 4: Construir prompt ───────────────────────────────────────────────
+    # ── Paso 3: Construir prompt ───────────────────────────────────────────────
     user_prompt = f"""## Convenciones obligatorias del proyecto
 {conventions}
 
@@ -165,6 +242,7 @@ Complejidad estimada: {task.estimated_complexity}
 {context}
 
 Implementa la tarea completa siguiendo ESTRICTAMENTE las convenciones del proyecto.
+Recuerda: escapa las triples comillas en docstrings como \\\"\\\"\\\".
 """
 
     if reviewer_feedback:
@@ -179,10 +257,12 @@ y enfócate en resolver lo indicado arriba. Revisa las convenciones si el error
 está relacionado con SQLModel, asyncpg, imports o tipos de datos.
 """
 
-    # ── Paso 5: Generar código ─────────────────────────────────────────────────
-    last_error = None
+    # ── Paso 4: Generar código ─────────────────────────────────────────────────
+    last_error: Exception | None = None
+
     for attempt in range(1, MAX_RETRIES + 1):
-        log.info("coder.attempt", attempt=attempt)
+        log_attempt = log.bind(attempt=attempt)
+        log_attempt.info("coder.attempt")
 
         try:
             response = await ollama.generate(
@@ -191,8 +271,7 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
                 model=settings.ollama_model,
             )
 
-            raw_json = _extract_json(response)
-            data = json.loads(raw_json)
+            data = _parse_response(response, log_attempt)
 
             files = data.get("files", [])
             summary = data.get("summary", "")
@@ -200,7 +279,7 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
             if not files:
                 raise ValueError("El modelo no generó ningún archivo")
 
-            # ── Paso 6: Escribir archivos ──────────────────────────────────────
+            # ── Paso 5: Escribir archivos ──────────────────────────────────────
             files_written = []
             for file_info in files:
                 path = file_info.get("path", "")
@@ -212,9 +291,9 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
                 result = await write_file(path, content)
                 if result.startswith("OK"):
                     files_written.append(path)
-                    log.info("coder.file_written", path=path)
+                    log_attempt.info("coder.file_written", path=path)
 
-            log.info("coder.done", files=len(files_written), attempt=attempt)
+            log_attempt.info("coder.done", files=len(files_written))
 
             return CoderResult(
                 files_written=files_written,
@@ -224,11 +303,16 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
 
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             last_error = e
-            log.warning("coder.parse_error", attempt=attempt, error=str(e))
-            user_prompt += f"\n\nNOTA: intento anterior falló: {e}. Responde SOLO con JSON válido."
+            log_attempt.warning("coder.parse_error", error=str(e))
+            user_prompt += (
+                f"\n\nNOTA: intento {attempt} falló con: {e}. "
+                "Responde SOLO con JSON válido. "
+                "Escapa las triples comillas: \\\"\\\"\\\" no \"\"\"."
+            )
             continue
 
     raise ValueError(
         f"El Coder no pudo implementar la tarea '{task.title}' "
         f"tras {MAX_RETRIES} intentos. Último error: {last_error}"
     )
+    

@@ -31,6 +31,7 @@ dependencies = [
 
     # ── Observabilidad ─────────────────────────────────────────────────────────
     "structlog>=24.0.0",         # logs estructurados con request_id
+    "json-repair>=0.30.0",     # repair fallback para docstrings no escapados
     "sentry-sdk[fastapi]>=2.0.0",
 ]
 
