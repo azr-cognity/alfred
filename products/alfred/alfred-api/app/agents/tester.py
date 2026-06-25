@@ -213,6 +213,7 @@ Corrige los tests para que pasen. Revisa imports, mocks y assertions.
                 model=settings.ollama_model,
                 format=None,
                 num_ctx=8192,
+                num_predict=8192,
             )
 
             raw_json = _extract_json(response)
