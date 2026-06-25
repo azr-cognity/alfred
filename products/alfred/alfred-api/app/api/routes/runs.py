@@ -27,6 +27,31 @@ logger = structlog.get_logger()
 
 STREAM_KEY = "alfred:runs"
 
+async def _resolve_project_uuid(name_or_id: str, session) -> str:
+    """Resuelve nombre o UUID de proyecto a UUID string.
+
+    Si name_or_id ya es un UUID válido lo retorna directo.
+    Si es un nombre, busca en la tabla projects.
+    Lanza HTTPException 404 si no existe.
+    """
+    import uuid as _uuid
+    try:
+        _uuid.UUID(name_or_id)
+        return name_or_id          # ya es UUID válido
+    except ValueError:
+        pass
+
+    row = await session.execute(
+        text("SELECT id FROM projects WHERE name = :name"),
+        {"name": name_or_id},
+    )
+    result = row.mappings().first()
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Proyecto '{name_or_id}' no encontrado",
+        )
+    return str(result["id"])
 
 def _redis() -> aioredis.Redis:
     return aioredis.from_url(settings.redis_url, decode_responses=True)
@@ -49,12 +74,16 @@ async def create_run(body: CreateRunRequest) -> RunResponse:
 
     # ── Persistir con status=queued ────────────────────────────────────────────
     async with AsyncSessionLocal() as session:
+        project_uuid = None
+        if getattr(body, "project_id", None):
+            project_uuid = await _resolve_project_uuid(str(body.project_id), session)
+
         await session.execute(
             text("""
                 INSERT INTO agent_runs
                     (id, prompt, status, current_agent, created_at, project_id)
                 VALUES
-                    (:id, :prompt, :status, :agent, :created_at, :project_id)
+                    (:id, :prompt, :status, :agent, :created_at, CAST(:project_id AS uuid))
             """),
             {
                 "id": str(run_id),
@@ -62,7 +91,7 @@ async def create_run(body: CreateRunRequest) -> RunResponse:
                 "status": "queued",
                 "agent": None,
                 "created_at": created_at,
-                "project_id": str(body.project_id) if getattr(body, "project_id", None) else None,
+                "project_id": project_uuid,
             },
         )
         await session.commit()

@@ -62,12 +62,14 @@ Responde ÚNICAMENTE con un objeto JSON válido:
 }
 
 Sin texto adicional, sin markdown, sin explicaciones.
+/no_think
 """
 
 
 class TesterResult:
     """Resultado de la ejecución del Tester."""
-
+    __test__ = False
+    
     def __init__(
         self,
         passed: bool,
@@ -209,6 +211,8 @@ Corrige los tests para que pasen. Revisa imports, mocks y assertions.
                 prompt=prompt,
                 system=SYSTEM_PROMPT,
                 model=settings.ollama_model,
+                format=None,
+                num_ctx=8192,
             )
 
             raw_json = _extract_json(response)

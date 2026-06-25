@@ -80,6 +80,7 @@ Responde con un JSON que contenga los archivos a crear o modificar:
 }
 
 Responde ÚNICAMENTE con el JSON. Sin texto adicional, sin markdown, sin <think>.
+/no_think
 """
 
 
@@ -269,6 +270,8 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
                 prompt=user_prompt,
                 system=SYSTEM_PROMPT,
                 model=settings.ollama_model,
+                format=None,   # json-repair maneja docstrings — no necesitamos grammar constraint
+                num_ctx=32768,
             )
 
             data = _parse_response(response, log_attempt)

@@ -42,7 +42,7 @@ async def search_codebase(query: str, limit: int = 5) -> list[dict]:
         Lista de dicts con {file_path, chunk_text, similarity}
     """
     # Generar embedding de la query
-    query_embedding = await ollama.embed(query)
+    query_embedding = await ollama.embed("nomic-embed-text", query)
     embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
     async with AsyncSessionLocal() as session:

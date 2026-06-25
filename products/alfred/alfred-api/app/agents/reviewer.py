@@ -66,6 +66,7 @@ Si el código cumple la tarea:
 
 Si el código NO cumple la tarea:
 {"approved": false, "feedback": "instrucción concreta y específica para que el Coder corrija el problema funcional"}
+/no_think
 """
 
 
@@ -178,6 +179,8 @@ Aprueba si implementa la funcionalidad correctamente, aunque tenga imperfeccione
                 prompt=prompt,
                 system=SYSTEM_PROMPT,
                 model=settings.ollama_model,
+                format=None,
+                num_ctx=8192,
             )
 
             raw_json = _extract_json(response)

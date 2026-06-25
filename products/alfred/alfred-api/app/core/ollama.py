@@ -1,161 +1,228 @@
 """
-Cliente Ollama con circuit breaker (S9).
+Módulo: ollama
+Propósito: Cliente HTTP singleton para Ollama con circuit breaker y soporte format:json.
+           Toda inferencia del sistema pasa por este módulo.
 
-Circuit breaker protege contra fallos en cascada cuando Ollama no responde:
-  - CLOSED (normal): peticiones pasan normalmente
-  - OPEN: tras FAILURE_THRESHOLD fallos consecutivos, falla inmediato sin llamar a Ollama
-  - HALF_OPEN: tras RECOVERY_TIMEOUT segundos, deja pasar una petición de prueba
+Dependencias clave:
+    - Ollama corriendo en host Windows (fuera de Docker): localhost:11434
+    - app.core.config: Settings con ollama_base_url y ollama_timeout
 
-Threshold: 5 fallos → open por 60s.
+Restricciones:
+    - Singleton — una sola instancia en todo el proceso
+    - Circuit breaker: 5 fallos consecutivos → abre por 60s
+    - format="json" SIEMPRE en llamadas de agentes — elimina retries por JSONDecodeError
+    - _strip_think_and_extract_json() sigue siendo necesario incluso con format=json
+      (qwen3.5 emite <think> antes del JSON y Ollama no lo filtra automáticamente)
+
+Consumido por: app/agents/*.py
+Versión: 1.1 | S11 — agrega format:json | Junio 2026 | Owner: AZR
 """
 
-import asyncio
 import time
-
-import httpx
+import json
+import asyncio
 import structlog
-
+import httpx
+from enum import Enum
 from app.core.config import settings
 
-logger = structlog.get_logger()
-
-# Circuit breaker config
-FAILURE_THRESHOLD = 5
-RECOVERY_TIMEOUT = 60  # segundos
+logger = structlog.get_logger(__name__)
 
 
-class CircuitOpenError(Exception):
-    """El circuit breaker está abierto — Ollama no está respondiendo."""
+class OllamaUnavailableError(Exception):
+    """Ollama no disponible — circuit breaker abierto o error de conexión."""
+    pass
 
 
-class CircuitBreaker:
-    """Circuit breaker simple en memoria para llamadas a Ollama."""
-
-    def __init__(self) -> None:
-        self._failures = 0
-        self._state = "closed"   # closed | open | half_open
-        self._opened_at: float = 0.0
-
-    def _try_recover(self) -> None:
-        if self._state == "open" and (time.monotonic() - self._opened_at) >= RECOVERY_TIMEOUT:
-            self._state = "half_open"
-            logger.info("circuit_breaker.half_open")
-
-    def record_success(self) -> None:
-        if self._state == "half_open":
-            logger.info("circuit_breaker.closed")
-        self._failures = 0
-        self._state = "closed"
-
-    def record_failure(self) -> None:
-        self._failures += 1
-        if self._failures >= FAILURE_THRESHOLD:
-            if self._state != "open":
-                self._opened_at = time.monotonic()
-                logger.warning("circuit_breaker.open", failures=self._failures)
-            self._state = "open"
-
-    def allow_request(self) -> bool:
-        self._try_recover()
-        if self._state == "closed":
-            return True
-        if self._state == "half_open":
-            return True   # deja pasar una petición de prueba
-        return False      # open — rechaza
+class CircuitState(Enum):
+    CLOSED = "closed"       # normal
+    OPEN = "open"           # bloqueado tras N fallos
+    HALF_OPEN = "half_open" # primer intento de recuperación
 
 
 class OllamaClient:
-    """Cliente async para Ollama con circuit breaker."""
+    """
+    Cliente HTTP singleton para Ollama con circuit breaker integrado.
+
+    Patrón de uso:
+        client = OllamaClient.get_instance()
+        raw = await client.generate(model="qwen3.5:35b-a3b", prompt="...", format="json")
+    """
+
+    _instance: "OllamaClient | None" = None
+
+    # Circuit breaker
+    FAILURE_THRESHOLD: int = 5
+    RECOVERY_TIMEOUT: int = 60   # segundos antes de intentar half-open
 
     def __init__(self) -> None:
-        self.base_url = settings.ollama_base_url
-        self.model = settings.ollama_model
-        self.embed_model = settings.ollama_embed_model
-        self._client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=httpx.Timeout(120.0),
-        )
-        self._cb = CircuitBreaker()
+        self._state = CircuitState.CLOSED
+        self._failure_count: int = 0
+        self._last_failure_time: float = 0.0
+        self._base_url: str = settings.ollama_base_url.rstrip("/")
+        self._timeout: float = float(settings.ollama_timeout)
 
-    async def _post(self, path: str, payload: dict) -> dict:
-        """Wrapper con circuit breaker para todas las llamadas POST."""
-        if not self._cb.allow_request():
-            raise CircuitOpenError(
-                f"Circuit breaker abierto — Ollama no responde "
-                f"(recovery en {RECOVERY_TIMEOUT}s)"
+    @classmethod
+    def get_instance(cls) -> "OllamaClient":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    # ------------------------------------------------------------------
+    # Circuit breaker
+    # ------------------------------------------------------------------
+
+    def _check_circuit(self) -> None:
+        """Verificar estado del circuit breaker antes de cada llamada."""
+        if self._state == CircuitState.CLOSED:
+            return
+        if self._state == CircuitState.OPEN:
+            elapsed = time.time() - self._last_failure_time
+            if elapsed >= self.RECOVERY_TIMEOUT:
+                self._state = CircuitState.HALF_OPEN
+                logger.info("ollama.circuit_half_open", elapsed_s=round(elapsed, 1))
+            else:
+                raise OllamaUnavailableError(
+                    f"Circuit breaker OPEN — esperar {self.RECOVERY_TIMEOUT - int(elapsed)}s"
+                )
+
+    def record_success(self) -> None:
+        """Registrar éxito — cierra el circuit breaker si estaba half-open."""
+        if self._state != CircuitState.CLOSED:
+            logger.info("ollama.circuit_closed")
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+
+    def record_failure(self) -> None:
+        """Registrar fallo — incrementa contador y abre el CB si supera el umbral."""
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+        if self._failure_count >= self.FAILURE_THRESHOLD or self._state == CircuitState.HALF_OPEN:
+            self._state = CircuitState.OPEN
+            logger.error(
+                "ollama.circuit_open",
+                failure_count=self._failure_count,
+                threshold=self.FAILURE_THRESHOLD,
             )
+
+    # ------------------------------------------------------------------
+    # HTTP
+    # ------------------------------------------------------------------
+
+    async def _post(self, endpoint: str, payload: dict) -> dict:
+        """Llamada HTTP POST a Ollama con circuit breaker y timeout."""
+        self._check_circuit()
+        url = f"{self._base_url}/{endpoint}"
         try:
-            response = await self._client.post(path, json=payload)
-            response.raise_for_status()
-            self._cb.record_success()
-            return response.json()
-        except (httpx.HTTPError, httpx.TimeoutException) as e:
-            self._cb.record_failure()
-            raise
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                self.record_success()
+                return data
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            self.record_failure()
+            raise OllamaUnavailableError(f"Ollama no responde: {e}") from e
+        except httpx.HTTPStatusError as e:
+            self.record_failure()
+            raise OllamaUnavailableError(f"Ollama HTTP {e.response.status_code}") from e
+
+    # ------------------------------------------------------------------
+    # API pública
+    # ------------------------------------------------------------------
 
     async def generate(
         self,
+        model: str,
         prompt: str,
         system: str | None = None,
-        model: str | None = None,
+        format: str | None = "json",   # "json" por defecto — SIEMPRE para agentes
+        temperature: float = 0.2,
+        num_predict: int = 4096,
+        num_ctx: int = 16384,
         stream: bool = False,
     ) -> str:
-        """Genera texto con el modelo configurado."""
+        """
+        Generar texto con un modelo Ollama.
+
+        Args:
+            model: Nombre del modelo (ej: "qwen3.5:35b-a3b", "qwen2.5-coder:7b").
+            prompt: Prompt del usuario.
+            system: System prompt del agente.
+            format: "json" fuerza output JSON válido. None para texto libre.
+                    USAR "json" EN TODOS LOS AGENTES — elimina retries por JSONDecodeError.
+            temperature: 0.1–0.2 para código, 0.3–0.4 para análisis.
+            num_predict: Tokens máximos de output.
+            stream: False siempre (streaming manejado por SSE en otro nivel).
+
+        Returns:
+            Texto generado por el modelo. Siempre limpiar con
+            _strip_think_and_extract_json() antes de json.loads().
+
+        Raises:
+            OllamaUnavailableError: Si el circuit breaker está abierto o Ollama no responde.
+        """
+        start = time.time()
         payload: dict = {
-            "model": model or self.model,
+            "model": model,
             "prompt": prompt,
             "stream": stream,
+            "options": {
+                "temperature": temperature,
+                "num_predict": num_predict,
+                "num_ctx": num_ctx,
+            },
         }
         if system:
             payload["system"] = system
+        if format:
+            payload["format"] = format
 
-        log = logger.bind(model=payload["model"], prompt_len=len(prompt))
-        log.info("ollama.generate.start")
-
-        result = await self._post("/api/generate", payload)
-        log.info("ollama.generate.done", tokens=result.get("eval_count", 0))
-        return result["response"]
-
-    async def chat(
-        self,
-        messages: list[dict],
-        system: str | None = None,
-        model: str | None = None,
-    ) -> str:
-        """Chat completions — formato OpenAI compatible."""
-        payload: dict = {
-            "model": model or self.model,
-            "messages": messages,
-            "stream": False,
-        }
-        if system:
-            if not any(m.get("role") == "system" for m in messages):
-                payload["messages"] = [{"role": "system", "content": system}] + messages
-
-        result = await self._post("/api/chat", payload)
-        return result["message"]["content"]
-
-    async def embed(self, text: str) -> list[float]:
-        """Genera embedding con nomic-embed-text."""
-        result = await self._post(
-            "/api/embeddings",
-            {"model": self.embed_model, "prompt": text},
+        logger.debug(
+            "ollama.generate.start",
+            model=model,
+            format=format,
+            prompt_len=len(prompt),
         )
-        return result["embedding"]
+
+        data = await self._post("api/generate", payload)
+        raw: str = data.get("response", "")
+        latency = round((time.time() - start) * 1000, 1)
+
+        logger.info(
+            "ollama.generate.done",
+            model=model,
+            format=format,
+            latency_ms=latency,
+            response_len=len(raw),
+            eval_count=data.get("eval_count"),
+        )
+        return raw
+
+    async def embed(self, model: str, text: str) -> list[float]:
+        """
+        Generar embedding para un texto.
+
+        Args:
+            model: Modelo de embeddings (ej: "nomic-embed-text").
+            text: Texto a embeddear.
+
+        Returns:
+            Lista de floats (768 dims para nomic-embed-text).
+        """
+        data = await self._post("api/embeddings", {"model": model, "prompt": text})
+        return data["embedding"]
 
     async def health(self) -> bool:
-        """Verifica que Ollama está corriendo y el modelo está disponible."""
+        """Verificar que Ollama está respondiendo. Usado en /api/health."""
         try:
-            response = await self._client.get("/api/tags")
-            response.raise_for_status()
-            models = [m["name"] for m in response.json().get("models", [])]
-            return self.model in models
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self._base_url}/api/tags")
+                return response.status_code == 200
         except Exception:
             return False
 
-    async def close(self) -> None:
-        await self._client.aclose()
 
-
-# Instancia global
-ollama = OllamaClient()
+# Singleton de conveniencia
+ollama_client = OllamaClient.get_instance()
+ollama = ollama_client
