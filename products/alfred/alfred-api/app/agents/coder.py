@@ -21,6 +21,8 @@ from app.schemas.runs import Task
 
 from .coder_tools import list_files, read_file, search_codebase, write_file
 
+from app.agents.routing import select_coder_model
+
 logger = structlog.get_logger()
 
 MAX_RETRIES = 3
@@ -270,7 +272,7 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
             response = await ollama.generate(
                 prompt=user_prompt,
                 system=SYSTEM_PROMPT,
-                model=settings.ollama_model,
+                model=select_coder_model(task),
                 format=None,   # json-repair maneja docstrings — no necesitamos grammar constraint
                 num_ctx=32768,
                 num_predict=8192,
