@@ -63,6 +63,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+norecursedirs  = ["tests/generated"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
