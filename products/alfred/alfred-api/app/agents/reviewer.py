@@ -178,9 +178,15 @@ Aprueba si implementa la funcionalidad correctamente, aunque tenga imperfeccione
             response = await ollama.generate(
                 prompt=prompt,
                 system=SYSTEM_PROMPT,
+<<<<<<< Updated upstream
                 model=settings.ollama_model,
                 format=None,
                 num_ctx=8192,
+=======
+                user=prompt,
+                temperature=0.4,
+                max_tokens=2048,   # respuesta corta: solo approved + feedback
+>>>>>>> Stashed changes
             )
 
             raw_json = _extract_json(response)
