@@ -10,6 +10,7 @@ Cambios respecto a S11:
 
 import json
 import re
+import ast
 
 import structlog
 from json_repair import repair_json
@@ -285,13 +286,18 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
 
             # ── Paso 5: Escribir archivos ──────────────────────────────────────
             files_written = []
+
             for file_info in files:
                 path = file_info.get("path", "")
                 content = file_info.get("content", "")
-
-                if not path or not content:
-                    continue
-
+                
+                # Validar sintaxis Python antes de escribir
+                if path.endswith(".py"):
+                    try:
+                        ast.parse(content)
+                    except SyntaxError as e:
+                        raise ValueError(f"SyntaxError en {path}: {e}") from e
+                
                 result = await write_file(path, content)
                 if result.startswith("OK"):
                     files_written.append(path)
