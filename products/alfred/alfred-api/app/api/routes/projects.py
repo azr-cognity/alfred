@@ -206,4 +206,62 @@ async def create_project(request: CreateProjectRequest) -> ProjectResponse:
 
 
 @router.patch("/projects/{project_id}", tags=["Projects"])
-async def update_project(project_id: str
+async def update_project(
+    project_id: str,
+    request: UpdateProjectRequest,
+) -> ProjectResponse:
+    """
+    Actualiza name o description de un proyecto existente.
+
+    Args:
+        project_id: UUID del proyecto a actualizar
+        request: Campos a actualizar (todos opcionales)
+
+    Returns:
+        Proyecto actualizado
+
+    Raises:
+        HTTPException 404 si el proyecto no existe
+    """
+    async with AsyncSessionLocal() as session:
+        # Verificar que existe
+        row = await session.execute(
+            text("SELECT id FROM projects WHERE id = CAST(:id AS uuid)"),
+            {"id": project_id},
+        )
+        if not row.mappings().first():
+            raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+
+        now = datetime.now(timezone.utc)
+        updates = {}
+        if request.name is not None:
+            updates["name"] = request.name
+        if request.description is not None:
+            updates["description"] = request.description
+        if request.repo_path is not None:
+            updates["repo_path"] = request.repo_path
+        if request.acd_path is not None:
+            updates["acd_path"] = request.acd_path
+
+        if updates:
+            set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+            updates["project_id"] = project_id
+            updates["updated_at"] = now
+            await session.execute(
+                text(f"""
+                    UPDATE projects
+                    SET {set_clause}, updated_at = :updated_at
+                    WHERE id = CAST(:project_id AS uuid)
+                """),
+                updates,
+            )
+            await session.commit()
+
+        row = await session.execute(
+            text("SELECT id, name, description, repo_path, acd_path, created_at, updated_at FROM projects WHERE id = CAST(:id AS uuid)"),
+            {"id": project_id},
+        )
+        result = row.mappings().first()
+
+    logger.info("projects.updated", project_id=project_id)
+    return _serialize_project(dict(result))

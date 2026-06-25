@@ -164,6 +164,7 @@ async def run_architect(prompt: str) -> Plan:
                 prompt=user_prompt,
                 system=SYSTEM_PROMPT,
                 model=settings.ollama_model,
+                format=None,
             )
 
             raw_json = _extract_json(response)
