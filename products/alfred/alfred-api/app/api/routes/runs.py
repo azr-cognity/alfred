@@ -123,16 +123,20 @@ async def create_run(body: CreateRunRequest) -> RunResponse:
 # --------------------------------------------------------------------------- #
 @router.get("/runs", tags=["Runs"])
 async def list_runs(
-    project_id: str | None = Query(default=None, description="Filtrar por proyecto"),
+    project_id: str | None = Query(default=None, description="Filtrar por proyecto (nombre o UUID)"),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     """
     Devuelve la lista de runs ordenados por created_at DESC.
-    Filtro opcional por project_id.
+    Filtro opcional por project_id (acepta nombre o UUID).
     """
     async with AsyncSessionLocal() as session:
+        resolved_pid: str | None = None
         if project_id:
+            resolved_pid = await _resolve_project_uuid(project_id, session)
+
+        if resolved_pid:
             rows = await session.execute(
                 text("""
                     SELECT id, prompt, status, current_agent, plan, result,
@@ -142,7 +146,7 @@ async def list_runs(
                     ORDER BY created_at DESC
                     LIMIT :limit OFFSET :offset
                 """),
-                {"project_id": project_id, "limit": limit, "offset": offset},
+                {"project_id": resolved_pid, "limit": limit, "offset": offset},
             )
         else:
             rows = await session.execute(
@@ -158,18 +162,16 @@ async def list_runs(
 
         runs = [dict(r) for r in rows.mappings()]
 
-        # Total para paginación
-        if project_id:
+        if resolved_pid:
             count_row = await session.execute(
                 text("SELECT COUNT(*) FROM agent_runs WHERE project_id = CAST(:project_id AS uuid)"),
-                {"project_id": project_id},
+                {"project_id": resolved_pid},
             )
         else:
             count_row = await session.execute(text("SELECT COUNT(*) FROM agent_runs"))
 
         total = count_row.scalar()
 
-    # Serializar UUIDs y fechas
     for r in runs:
         r["id"] = str(r["id"])
         r["project_id"] = str(r["project_id"]) if r.get("project_id") else None
@@ -210,6 +212,50 @@ async def get_run(run_id: str) -> dict:
 
     return data
 
+
+# --------------------------------------------------------------------------- #
+# GET /api/runs/{run_id}/steps  — pasos del pipeline
+# --------------------------------------------------------------------------- #
+@router.get("/runs/{run_id}/steps", tags=["Runs"])
+async def get_run_steps(run_id: str) -> dict:
+    """
+    Devuelve los pasos (agent_steps) de un run en orden cronológico.
+
+    Útil para la UI y para debugging del pipeline. Incluye el output
+    completo de cada agente (coder, reviewer, tester, auditor).
+    """
+    async with AsyncSessionLocal() as session:
+        run_row = await session.execute(
+            text("SELECT id, status FROM agent_runs WHERE id = CAST(:id AS uuid)"),
+            {"id": run_id},
+        )
+        run = run_row.mappings().first()
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' no encontrado")
+
+        steps_rows = await session.execute(
+            text("""
+                SELECT id, run_id, agent_name, status, output, created_at, completed_at
+                FROM agent_steps
+                WHERE run_id = CAST(:run_id AS uuid)
+                ORDER BY created_at ASC
+            """),
+            {"run_id": run_id},
+        )
+        steps = [dict(r) for r in steps_rows.mappings()]
+
+    for s in steps:
+        s["id"] = str(s["id"])
+        s["run_id"] = str(s["run_id"])
+        s["created_at"] = s["created_at"].isoformat() if s.get("created_at") else None
+        s["completed_at"] = s["completed_at"].isoformat() if s.get("completed_at") else None
+
+    return {
+        "run_id": run_id,
+        "run_status": run["status"],
+        "steps": steps,
+        "total": len(steps),
+    }
 
 # --------------------------------------------------------------------------- #
 # GET /api/runs/{run_id}/status  — SSE
