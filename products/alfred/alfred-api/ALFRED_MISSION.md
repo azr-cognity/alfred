@@ -141,5 +141,23 @@ a `alfred-api/` para código Python y a `alfred-ui/` para código TypeScript.
 
 ---
 
+## Archivos protegidos — NUNCA sobreescribir
+
+Alfred NUNCA debe crear ni modificar estos archivos sin instrucción explícita:
+
+- `app/schemas/runs.py`       ← contratos del pipeline completo
+- `app/orchestrator/state.py` ← GraphState y reducers
+- `app/orchestrator/graph.py` ← definición del grafo LangGraph
+- `app/core/config.py`        ← Settings globales
+- `app/core/database.py`      ← pool de conexiones
+- `app/main.py`               ← FastAPI app y routers
+- `pyproject.toml`            ← dependencias del proyecto
+- `CONVENTIONS.md`            ← este mismo archivo
+- `ALFRED_MISSION.md`         ← este mismo archivo
+
+Si una task requiere modificar uno de estos archivos, la tarea debe
+indicarlo EXPLÍCITAMENTE en `files_to_modify` con la ruta exacta.
+De lo contrario, está prohibido tocarlos.
+
 *ALFRED_MISSION.md · Cognity SpA · Junio 2026*
 *Actualizar cuando cambie el stack o las reglas de planning*
