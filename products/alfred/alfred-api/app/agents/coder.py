@@ -272,6 +272,7 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
                 model=settings.ollama_model,
                 format=None,   # json-repair maneja docstrings — no necesitamos grammar constraint
                 num_ctx=32768,
+                num_predict=8192,
             )
 
             data = _parse_response(response, log_attempt)

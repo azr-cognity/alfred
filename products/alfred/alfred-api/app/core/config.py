@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen3.5:35b-a3b"
     ollama_model_fast: str = "qwen2.5-coder:14b"
     ollama_embed_model: str = "nomic-embed-text"
+    ollama_timeout: float = 300.0        # segundos — modelos grandes necesitan >60s
+
 
     # ── OPA ────────────────────────────────────────────────────────────────────
     opa_url: str = "http://localhost:8181"
