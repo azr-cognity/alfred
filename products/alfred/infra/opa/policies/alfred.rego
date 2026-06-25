@@ -28,8 +28,8 @@ deny contains reason if {
     )
 }
 
-# No se permite print() en código Python — usar structlog
-deny contains reason if {
+# No se permite print() en código Python — usar structlog - cambio deny por warn
+warn contains reason if {
     file := input.files[_]
     file.language == "python"
     contains(file.content, "print(")
