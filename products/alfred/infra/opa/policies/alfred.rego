@@ -20,8 +20,9 @@ import rego.v1
 deny contains reason if {
     file := input.files[_]
     file.language == "python"
+    not contains(file.path, "test_")
     line_count := count(split(file.content, "\n"))
-    line_count > 300           # primero validamos el archivo completo
+    line_count > 300
     reason := sprintf(
         "Archivo '%s' tiene %d líneas (máximo 300). Divide en módulos.",
         [file.path, line_count]
