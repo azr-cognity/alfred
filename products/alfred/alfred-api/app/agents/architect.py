@@ -3,10 +3,13 @@ Agente Architect — el planificador de Alfred (S12).
 
 Cambios respecto a S11:
   - Lee ALFRED_MISSION.md antes de planificar (Paso 1).
-    Define reglas de asignacion de agentes, max tasks, archivos obligatorios
-    y antipatrones — equivalente a CONVENTIONS.md para el Coder.
   - format=None en ollama.generate (format=json causaba response_len=0).
   - SYSTEM_PROMPT simplificado — las reglas de planning van en ALFRED_MISSION.md.
+
+Cambios v2.4 (ADR-008, ADR-011):
+  - Migrado a get_provider("architect") — usa Claude API en modo hybrid.
+  - _extract_json ya no necesita strip_think: OllamaProvider lo centraliza.
+  - temperature=0.3 pasada explícitamente a provider.generate().
 """
 
 import json
@@ -15,8 +18,7 @@ from pathlib import Path
 
 import structlog
 
-from app.core.config import settings
-from app.core.ollama import ollama
+from app.core.llm import get_provider
 from app.schemas.runs import Plan, Task, TaskPriority
 
 logger = structlog.get_logger()
@@ -68,8 +70,11 @@ Valores validos:
 
 
 def _extract_json(text: str) -> str:
-    """Extrae JSON de la respuesta del modelo, filtrando bloques think."""
-    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    """Extrae JSON de la respuesta del modelo.
+
+    No aplica strip_think: OllamaProvider ya lo centraliza (ADR-011).
+    AnthropicProvider no emite <think> (Gotcha #27).
+    """
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         return match.group(1).strip()
@@ -112,8 +117,7 @@ def _parse_plan(raw_json: str) -> Plan:
 async def _read_mission() -> str:
     """Lee ALFRED_MISSION.md desde el PROJECT_ROOT del Coder.
 
-    Intenta leerlo desde la misma ubicacion que CONVENTIONS.md.
-    Si no existe, retorna string vacio — el Architect opera sin contexto de mision.
+    Si no existe, retorna string vacío — el Architect opera sin contexto de misión.
     """
     try:
         from app.agents.coder_tools import PROJECT_ROOT
@@ -133,8 +137,8 @@ async def _read_mission() -> str:
 async def run_architect(prompt: str) -> Plan:
     """Punto de entrada del agente Architect.
 
-    Lee ALFRED_MISSION.md antes de planificar para aplicar reglas de
-    asignacion de agentes, limite de tasks y estructura de archivos.
+    Lee ALFRED_MISSION.md antes de planificar. En modo hybrid usa Claude API
+    (ADR-008); en full_local usa Ollama — transparente para este módulo (ADR-011).
 
     Args:
         prompt: el objetivo del usuario en lenguaje natural.
@@ -143,7 +147,7 @@ async def run_architect(prompt: str) -> Plan:
         Plan validado con tasks, prioridades y dependencias.
 
     Raises:
-        ValueError: Si no puede producir un plan valido tras MAX_RETRIES intentos.
+        ValueError: Si no puede producir un plan válido tras MAX_RETRIES intentos.
     """
     log = logger.bind(agent="architect", prompt_len=len(prompt))
     log.info("architect.start")
@@ -154,6 +158,10 @@ async def run_architect(prompt: str) -> Plan:
     if mission:
         mission_section = f"\n\n## ALFRED_MISSION.md — reglas obligatorias de planning\n{mission}"
 
+    # ADR-011: get_provider() decide Ollama vs Claude API según settings.llm_mode
+    # complexity="medium" → sonnet en hybrid (opus se activa con complexity="high")
+    provider = get_provider("architect", task_complexity="medium")
+
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -163,24 +171,23 @@ async def run_architect(prompt: str) -> Plan:
 
         if last_error and attempt > 1:
             user_prompt += (
-                f"\n\nNOTA: intento anterior fallo con: {last_error}. "
-                "Responde UNICAMENTE con JSON valido. "
+                f"\n\nNOTA: intento anterior falló con: {last_error}. "
+                "Responde ÚNICAMENTE con JSON válido. "
                 "Recuerda: agent='coder' para cualquier task que cree archivos."
             )
 
         try:
-            response = await ollama.generate(
-                prompt=user_prompt,
+            # ADR-008: frontier en modo hybrid; ADR-011: interfaz única
+            llm_response = await provider.generate(
                 system=SYSTEM_PROMPT,
-                model=settings.ollama_model,
-                format=None,    # format=json causaba response_len=0 con qwen3.5
-                num_ctx=16384,
+                user=user_prompt,
+                temperature=0.3,
             )
 
-            raw_json = _extract_json(response)
+            raw_json = _extract_json(llm_response.content)
             plan = _parse_plan(raw_json)
 
-            # Validacion adicional: advertir si hay tasks sin archivos
+            # Advertir si hay tasks de coder sin archivos declarados
             for task in plan.tasks:
                 if task.agent == "coder" and not task.files_to_create and not task.files_to_modify:
                     log.warning(
@@ -198,6 +205,6 @@ async def run_architect(prompt: str) -> Plan:
             continue
 
     raise ValueError(
-        f"El Architect no pudo producir un plan valido tras {MAX_RETRIES} intentos. "
-        f"Ultimo error: {last_error}"
+        f"El Architect no pudo producir un plan válido tras {MAX_RETRIES} intentos. "
+        f"Último error: {last_error}"
     )

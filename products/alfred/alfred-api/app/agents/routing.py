@@ -1,84 +1,123 @@
 """
 Módulo: routing
-Propósito: Selección de modelo Ollama según la complejidad de una Task.
-           Función pura y síncrona — sin I/O, sin efectos secundarios.
-           Permite que el Coder use qwen2.5-coder:14b para tareas boilerplate
-           (3x más rápido) y reserve qwen3.5:35b-a3b para lógica compleja.
+Propósito: Routing de modelos para el agente Coder. Decide qué provider y modelo
+           usar en función de la complejidad y el riesgo de la tarea (ADR-011 v2.4).
 
-Consumido por:
-    app.orchestrator.nodes: coder_node llama select_coder_model()
-    antes de invocar run_coder() para elegir el modelo correcto.
+Dependencias clave:
+    - app.core.config: settings.ollama_model, frontier_coder, llm_mode
+    - app.schemas.runs: Task (campo estimated_complexity, title, description,
+                        files_to_create)
 
 Restricciones:
-    - Función síncrona y pura (sin await, sin DB, sin Ollama)
-    - Sin print() — sin logs (función pura no necesita logging)
-    - Type hints completos en toda función pública
+    - Función pura y síncrona — no hace I/O ni llama a ningún provider.
+    - El resultado se pasa a get_provider() en coder.py para instanciar el provider.
+    - En modo full_local, get_provider() ignorará el "frontier" del routing.
 
-Versión: 1.0 | Junio 2026 | Owner: AZR
+Consumido por: app/agents/coder.py → get_provider(agent="coder", task_complexity=...)
+Versión: 2.0 | Junio 2026 | Owner: AZR
 """
+
+from __future__ import annotations
 
 from app.core.config import settings
 from app.schemas.runs import Task
 
 # ---------------------------------------------------------------------------
-# Constantes de clasificación
+# Keyword sets para clasificación de tareas
 # ---------------------------------------------------------------------------
 
-BOILERPLATE_KEYWORDS: frozenset[str] = frozenset({
-    "schema",
-    "pydantic",
-    "crud",
-    "test",
-    "fixture",
-    "mock",
-    "response_model",
-    "router basico",
-    "endpoint simple",
-})
+# Señales de ALTA dificultad + ALTO costo de error → frontier
+_HIGH_RISK_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "conciliacion",
+        "reconciliation",
+        "matching",
+        "motor",
+        "rls",
+        "multi-tenant",
+        "tenant_isolation",
+        "auth",
+        "autenticacion",
+        "seguridad",
+        "security",
+        "reintento",
+        "retry",
+        "idempotencia",
+        "decimal",
+        "monto",
+        "financiero",
+    }
+)
 
-BOILERPLATE_MAX_FILES: int = 1
+# Señales de boilerplate → local rápido
+_BOILERPLATE_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "schema",
+        "pydantic",
+        "crud",
+        "test",
+        "fixture",
+        "mock",
+        "response_model",
+        "router basico",
+        "endpoint simple",
+        "ping",
+        "health",
+        "migration simple",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
-# API pública
+# Función pública
 # ---------------------------------------------------------------------------
 
+def select_coder_model(task: Task) -> tuple[str, str]:
+    """Determinar el provider y modelo óptimo para una tarea del Coder.
 
-def select_coder_model(task: Task) -> str:
-    """Selecciona el modelo Ollama para ejecutar una task del Coder.
+    Retorna (provider_type, model_name) en lugar del str plano de v2.3.
+    provider_type: "local" | "frontier"
 
-    Lógica de clasificación (en orden de prioridad):
-      1. Si estimated_complexity == 'high' → siempre modelo principal (35B)
-      2. Si estimated_complexity == 'low' → modelo rápido (14B)
-      3. Si el título o descripción contiene una keyword boilerplate
-         Y files_to_create tiene exactamente 1 archivo → modelo rápido (14B)
-      4. Caso contrario → modelo principal (35B)
+    Lógica de decisión (en orden de prioridad):
+        1. alta complejidad + keyword de riesgo → frontier
+        2. alta complejidad sin riesgo          → local 35B (razonamiento local suficiente)
+        3. baja complejidad                     → local 14B (boilerplate rápido)
+        4. media + boilerplate score ≥ 2 + 1 archivo → local 14B
+        5. media + keyword de riesgo            → frontier
+        6. media sin señales                    → local 35B (default seguro)
 
     Args:
-        task: Task del plan a evaluar.
+        task: Task del Architect con estimated_complexity, title, description,
+              files_to_create.
 
     Returns:
-        Nombre del modelo Ollama a usar (string). Uno de:
-        - settings.ollama_model      (qwen3.5:35b-a3b  — razonamiento)
-        - settings.ollama_model_fast (qwen2.5-coder:14b — boilerplate)
+        Tupla (provider_type, model_name). El Coder pasa esto a get_provider().
     """
-    # Alta complejidad siempre usa el modelo principal
+    combined = (task.title + " " + task.description).lower()
+
+    # ── 1. Alta complejidad ──────────────────────────────────────────────
     if task.estimated_complexity == "high":
-        return settings.ollama_model
+        if any(kw in combined for kw in _HIGH_RISK_KEYWORDS):
+            # Riesgo alto + complejidad alta → frontier (error costoso de escapar)
+            return ("frontier", settings.frontier_coder)
+        # Alta complejidad sin keywords de riesgo → 35B local (razonamiento suficiente)
+        return ("local", settings.ollama_model)
 
-    # Baja complejidad siempre usa el modelo rápido
+    # ── 2. Baja complejidad → local rápido ──────────────────────────────
     if task.estimated_complexity == "low":
-        return settings.ollama_model_fast
+        return ("local", settings.ollama_model_fast)
 
-    # Complejidad media: clasificar por keywords + número de archivos
-    title_lower = task.title.lower()
-    desc_lower = task.description.lower() if task.description else ""
-    combined = f"{title_lower} {desc_lower}"
+    # ── 3. Complejidad media ─────────────────────────────────────────────
+    boilerplate_score = sum(1 for kw in _BOILERPLATE_KEYWORDS if kw in combined)
+    files_count = len(task.files_to_create) if task.files_to_create else 0
 
-    has_keyword = any(kw in combined for kw in BOILERPLATE_KEYWORDS)
-    single_file = len(task.files_to_create) <= BOILERPLATE_MAX_FILES
+    # Boilerplate claro + archivo único → local rápido
+    if boilerplate_score >= 2 and files_count <= 1:
+        return ("local", settings.ollama_model_fast)
 
-    if has_keyword and single_file:
-        return settings.ollama_model_fast
+    # Media + riesgo → frontier
+    if any(kw in combined for kw in _HIGH_RISK_KEYWORDS):
+        return ("frontier", settings.frontier_coder)
 
-    return settings.ollama_model
+    # Default medio → local principal (35B)
+    return ("local", settings.ollama_model)

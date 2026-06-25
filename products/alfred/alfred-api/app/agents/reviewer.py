@@ -5,13 +5,19 @@ Cambios respecto a S6:
   - SYSTEM_PROMPT ajustado: distingue entre razones válidas e inválidas para
     rechazar. Deja los detalles de estilo y formato para OPA.
 
+Cambios v2.4 (ADR-008, ADR-011):
+  - Migrado a get_provider("reviewer") — usa Claude API en modo hybrid.
+  - _extract_json ya no necesita strip_think: OllamaProvider lo centraliza.
+  - temperature=0.4 pasada explícitamente a provider.generate().
+  - task.estimated_complexity pasada a get_provider() para routing futuro.
+
 Responsabilidad:
   Evalúa si el código generado por el Coder cumple el objetivo de la task.
 
 Cómo funciona:
   1. Recibe la task y la lista de archivos escritos por el Coder
   2. Lee el contenido real de los archivos
-  3. Llama al modelo via Ollama
+  3. Llama al provider via get_provider() (Claude API o Ollama según modo)
   4. Parsea la respuesta JSON en un ReviewerResult
   5. Si el JSON es inválido, reintenta hasta MAX_RETRIES veces
   6. Si no puede parsear tras MAX_RETRIES, retorna approved=False (no lanza excepción)
@@ -22,8 +28,7 @@ import re
 
 import structlog
 
-from app.core.config import settings
-from app.core.ollama import ollama
+from app.core.llm import get_provider
 from app.schemas.runs import Task
 
 from .coder_tools import read_file
@@ -32,7 +37,7 @@ logger = structlog.get_logger()
 
 MAX_RETRIES = 3
 
-# ── System prompt ──────────────────────────────────────────────────────────────
+# ── System prompt ────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Eres el Reviewer de Alfred, un evaluador de código pragmático y constructivo.
 
@@ -85,11 +90,11 @@ class ReviewerResult:
 
 
 def _extract_json(text: str) -> str:
+    """Extrae el JSON de la respuesta del modelo.
+
+    No aplica strip_think: OllamaProvider ya lo centraliza (ADR-011).
+    AnthropicProvider no emite <think> (Gotcha #27).
     """
-    Extrae el JSON de la respuesta del modelo.
-    Filtra bloques <think>...</think> que emite qwen3.5 antes del JSON.
-    """
-    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         return match.group(1).strip()
@@ -100,9 +105,10 @@ def _extract_json(text: str) -> str:
 
 
 def _parse_reviewer_result(raw_json: str, task_id: str) -> ReviewerResult:
-    """
-    Parsea el JSON del modelo en un ReviewerResult validado.
-    Lanza ValueError si el JSON es inválido o no tiene la estructura esperada.
+    """Parsea el JSON del modelo en un ReviewerResult validado.
+
+    Raises:
+        ValueError: Si el JSON es inválido o no tiene la estructura esperada.
     """
     data = json.loads(raw_json)
 
@@ -122,20 +128,22 @@ def _parse_reviewer_result(raw_json: str, task_id: str) -> ReviewerResult:
 
 
 async def run_reviewer(task: Task, files_written: list[str]) -> ReviewerResult:
-    """
-    Punto de entrada del agente Reviewer.
+    """Punto de entrada del agente Reviewer.
+
+    En modo hybrid usa Claude API (ADR-008); en full_local usa Ollama —
+    transparente para este módulo (ADR-011).
 
     Args:
-        task: la tarea del plan del Architect
-        files_written: rutas de archivos escritos por el Coder
+        task: la tarea del plan del Architect.
+        files_written: rutas de archivos escritos por el Coder.
 
     Returns:
-        ReviewerResult con approved, feedback y task_id
+        ReviewerResult con approved, feedback y task_id.
     """
     log = logger.bind(agent="reviewer", task_id=task.id, task=task.title)
     log.info("reviewer.start", files=len(files_written))
 
-    # ── Leer contenido de los archivos escritos ────────────────────────────────
+    # ── Leer contenido de los archivos escritos ──────────────────────────────
     file_contents: list[str] = []
     for path in files_written:
         content = await read_file(path)
@@ -161,6 +169,10 @@ Evalúa si el código cumple funcionalmente el objetivo de la tarea.
 Aprueba si implementa la funcionalidad correctamente, aunque tenga imperfecciones menores de estilo.
 """
 
+    # ADR-011: get_provider() decide Ollama vs Claude API según settings.llm_mode
+    # Pasamos estimated_complexity para routing futuro (en hybrid, reviewer siempre es frontier)
+    provider = get_provider("reviewer", task_complexity=task.estimated_complexity)
+
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -175,15 +187,15 @@ Aprueba si implementa la funcionalidad correctamente, aunque tenga imperfeccione
             )
 
         try:
-            response = await ollama.generate(
-                prompt=prompt,
+            # ADR-008: frontier en modo hybrid; ADR-011: interfaz única
+            llm_response = await provider.generate(
                 system=SYSTEM_PROMPT,
-                model=settings.ollama_model,
-                format=None,
-                num_ctx=8192,
+                user=prompt,
+                temperature=0.4,
+                max_tokens=512,   # respuesta corta: solo approved + feedback
             )
 
-            raw_json = _extract_json(response)
+            raw_json = _extract_json(llm_response.content)
             result = _parse_reviewer_result(raw_json, task.id)
 
             log.info(
