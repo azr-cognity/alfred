@@ -269,11 +269,7 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
             response = await ollama.generate(
                 prompt=user_prompt,
                 system=SYSTEM_PROMPT,
-<<<<<<< Updated upstream
-                model=settings.ollama_model,
-=======
                 model=select_coder_model(task)[1],
->>>>>>> Stashed changes
                 format=None,   # json-repair maneja docstrings — no necesitamos grammar constraint
                 num_ctx=32768,
             )
@@ -323,3 +319,4 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
         f"tras {MAX_RETRIES} intentos. Último error: {last_error}"
     )
     
+

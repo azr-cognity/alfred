@@ -10,11 +10,15 @@ Cambios v2.4 (ADR-008, ADR-011):
   - Migrado a get_provider("architect") — usa Claude API en modo hybrid.
   - _extract_json ya no necesita strip_think: OllamaProvider lo centraliza.
   - temperature=0.3 pasada explícitamente a provider.generate().
+
+Cambios S13:
+  - run_architect() acepta dependency_context opcional.
+  - Si se pasa, se inyecta en el prompt para que el Architect considere
+    qué archivos dependen de los que va a tocar.
 """
 
 import json
 import re
-from pathlib import Path
 
 import structlog
 
@@ -70,11 +74,7 @@ Valores validos:
 
 
 def _extract_json(text: str) -> str:
-    """Extrae JSON de la respuesta del modelo.
-
-    No aplica strip_think: OllamaProvider ya lo centraliza (ADR-011).
-    AnthropicProvider no emite <think> (Gotcha #27).
-    """
+    """Extrae JSON de la respuesta del modelo."""
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         return match.group(1).strip()
@@ -85,13 +85,8 @@ def _extract_json(text: str) -> str:
 
 
 def _parse_plan(raw_json: str) -> Plan:
-    """Parsea el JSON del modelo en un objeto Plan validado.
-
-    Raises:
-        ValueError: Si el JSON es invalido o no tiene la estructura esperada.
-    """
+    """Parsea el JSON del modelo en un objeto Plan validado."""
     data = json.loads(raw_json)
-
     tasks = []
     for t in data.get("tasks", []):
         tasks.append(Task(
@@ -105,7 +100,6 @@ def _parse_plan(raw_json: str) -> Plan:
             files_to_create=t.get("files_to_create", []),
             files_to_modify=t.get("files_to_modify", []),
         ))
-
     return Plan(
         summary=data["summary"],
         tasks=tasks,
@@ -115,10 +109,7 @@ def _parse_plan(raw_json: str) -> Plan:
 
 
 async def _read_mission() -> str:
-    """Lee ALFRED_MISSION.md desde el PROJECT_ROOT del Coder.
-
-    Si no existe, retorna string vacío — el Architect opera sin contexto de misión.
-    """
+    """Lee ALFRED_MISSION.md desde el PROJECT_ROOT del Coder."""
     try:
         from app.agents.coder_tools import PROJECT_ROOT
         mission_path = PROJECT_ROOT / MISSION_PATH
@@ -134,40 +125,50 @@ async def _read_mission() -> str:
         return ""
 
 
-async def run_architect(prompt: str) -> Plan:
+async def run_architect(
+    prompt: str,
+    dependency_context: str = "",
+) -> Plan:
     """Punto de entrada del agente Architect.
 
     Lee ALFRED_MISSION.md antes de planificar. En modo hybrid usa Claude API
-    (ADR-008); en full_local usa Ollama — transparente para este módulo (ADR-011).
+    (ADR-008); en full_local usa Ollama (ADR-011).
+
+    Si se pasa dependency_context (S13), se inyecta en el prompt para que
+    el Architect considere qué archivos dependen de los que va a modificar.
 
     Args:
-        prompt: el objetivo del usuario en lenguaje natural.
+        prompt: Objetivo del usuario en lenguaje natural.
+        dependency_context: Contexto del grafo de dependencias (S13, opcional).
+            Construido por get_dependency_context_str() en architect_node.
 
     Returns:
         Plan validado con tasks, prioridades y dependencias.
 
     Raises:
-        ValueError: Si no puede producir un plan válido tras MAX_RETRIES intentos.
+        ValueError: Si no produce un plan válido tras MAX_RETRIES intentos.
     """
     log = logger.bind(agent="architect", prompt_len=len(prompt))
     log.info("architect.start")
 
-    # Paso 1: leer ALFRED_MISSION.md
     mission = await _read_mission()
     mission_section = ""
     if mission:
         mission_section = f"\n\n## ALFRED_MISSION.md — reglas obligatorias de planning\n{mission}"
 
-    # ADR-011: get_provider() decide Ollama vs Claude API según settings.llm_mode
-    # complexity="medium" → sonnet en hybrid (opus se activa con complexity="high")
-    provider = get_provider("architect", task_complexity="medium")
+    # S13: inyectar contexto de dependencias si existe
+    dep_section = ""
+    if dependency_context:
+        dep_section = f"\n\n{dependency_context}"
+        log.info("architect.dep_context_injected", chars=len(dependency_context))
 
+    provider = get_provider("architect", task_complexity="medium")
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         log.info("architect.attempt", attempt=attempt)
 
-        user_prompt = f"{prompt}{mission_section}"
+        user_prompt = f"{prompt}{mission_section}{dep_section}"
 
         if last_error and attempt > 1:
             user_prompt += (
@@ -177,7 +178,6 @@ async def run_architect(prompt: str) -> Plan:
             )
 
         try:
-            # ADR-008: frontier en modo hybrid; ADR-011: interfaz única
             llm_response = await provider.generate(
                 system=SYSTEM_PROMPT,
                 user=user_prompt,
@@ -187,7 +187,6 @@ async def run_architect(prompt: str) -> Plan:
             raw_json = _extract_json(llm_response.content)
             plan = _parse_plan(raw_json)
 
-            # Advertir si hay tasks de coder sin archivos declarados
             for task in plan.tasks:
                 if task.agent == "coder" and not task.files_to_create and not task.files_to_modify:
                     log.warning(

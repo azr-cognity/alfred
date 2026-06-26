@@ -9,7 +9,15 @@ Cambios respecto a S7:
     Si hay findings HIGH: status=failed. Si pasa: status=done.
   - route_after_dispatch: nuevo branch "auditor" para status=auditing.
   - route_after_auditor: auditor -> END siempre (es el nodo terminal).
+
+Cambios S13:
+  - architect_node: dos pasadas cuando el grafo de dependencias tiene contexto.
+    1. Plan inicial. 2. Consultar grafo → re-planificar si hay deps no cubiertas.
+  - _get_project_id_for_run(): helper para obtener project_id desde run_id.
 """
+
+import structlog as _structlog
+from sqlalchemy import text as _text
 
 from langgraph.graph import END
 
@@ -19,7 +27,9 @@ from app.agents.coder import run_coder
 from app.agents.coder_tools import read_file
 from app.agents.reviewer import run_reviewer, ReviewerResult
 from app.agents.tester import run_tester, TesterResult
+from app.core.database import AsyncSessionLocal as _AsyncSessionLocal
 from app.core.opa import opa
+from app.graph.dependency_query import get_dependency_context_str as _get_dep_context
 
 from app.orchestrator.state import (
     MAX_REVIEWER_RETRIES,
@@ -30,6 +40,8 @@ from app.orchestrator.state import (
     ready_tasks,
     validate_dag,
 )
+
+_node_logger = _structlog.get_logger()
 
 
 def _task_by_id(state: GraphState, task_id: str) -> Task:
@@ -57,27 +69,82 @@ def _last_coder_step(state: GraphState, task_id: str) -> AgentStep | None:
 
 
 # --------------------------------------------------------------------------- #
+# Helper S13
+# --------------------------------------------------------------------------- #
+
+async def _get_project_id_for_run(run_id: str) -> str:
+    """Obtener project_id de un run desde la DB.
+
+    Necesario para consultar code_dependencies, particionada por proyecto.
+    """
+    async with _AsyncSessionLocal() as session:
+        row = await session.execute(
+            _text("SELECT CAST(project_id AS text) FROM agent_runs WHERE id = CAST(:id AS uuid)"),
+            {"id": run_id},
+        )
+        result = row.fetchone()
+        if not result:
+            raise ValueError(f"run_id {run_id} no encontrado en agent_runs")
+        return result[0]
+
+
+# --------------------------------------------------------------------------- #
 # Nodos
 # --------------------------------------------------------------------------- #
 
 async def architect_node(state: GraphState) -> dict:
-    """Planifica: prompt -> Plan. Valida el DAG antes de despachar nada."""
+    """Planifica: prompt -> Plan. Valida el DAG antes de despachar nada.
+
+    S13: dos pasadas cuando el grafo de dependencias tiene contexto relevante.
+      1. Plan inicial sin contexto de dependencias.
+      2. Extraer archivos del plan → consultar grafo → si hay deps no cubiertas,
+         re-planificar con ese contexto inyectado en el prompt.
+      El error en el grafo nunca bloquea el pipeline — falla silenciosamente.
+    """
     try:
+        # ── Pasada 1: plan inicial ────────────────────────────────────────────
         plan = await run_architect(state["prompt"])
         validate_dag(plan)
+
+        # ── S13: consultar grafo de dependencias ─────────────────────────────
+        planned_files: list[str] = []
+        for task in plan.tasks:
+            planned_files.extend(task.files_to_create or [])
+            planned_files.extend(task.files_to_modify or [])
+
+        if planned_files:
+            try:
+                project_id = await _get_project_id_for_run(state["run_id"])
+                dep_context = await _get_dep_context(planned_files, project_id)
+
+                if dep_context:
+                    _node_logger.info(
+                        "architect.dep_context_found",
+                        planned_files=len(planned_files),
+                        context_chars=len(dep_context),
+                    )
+                    # ── Pasada 2: re-planificar con contexto de deps ──────────
+                    plan = await run_architect(
+                        state["prompt"],
+                        dependency_context=dep_context,
+                    )
+                    validate_dag(plan)
+                    _node_logger.info("architect.replanned_with_deps", tasks=len(plan.tasks))
+
+            except Exception as dep_err:
+                # El grafo falla silenciosamente — no bloquea el pipeline
+                _node_logger.warning("architect.dep_context_error", error=str(dep_err))
+
     except DagError as e:
         return {"plan": None, "status": "failed", "error": f"Plan inválido: {e}"}
     except Exception as e:
         return {"plan": None, "status": "failed", "error": f"Architect falló: {e}"}
+
     return {"plan": plan, "status": "dispatching"}
 
 
 def dispatcher_node(state: GraphState) -> dict:
-    """Elige la siguiente task lista, o decide auditing/failed.
-
-    S8: cuando todas las tasks están completas emite status=auditing
-    en lugar de done. El Auditor es el nodo terminal que emite done.
-    """
+    """Elige la siguiente task lista, o decide auditing/failed."""
     if state["status"] == "failed":
         return {"current_task_id": None}
 
@@ -86,7 +153,6 @@ def dispatcher_node(state: GraphState) -> dict:
 
     completed = state["completed"]
     if len(completed) == len(plan.tasks):
-        # Todas completas → pasar al Auditor
         return {
             "current_task_id": None,
             "status": "auditing",
@@ -110,11 +176,7 @@ def dispatcher_node(state: GraphState) -> dict:
 
 
 async def coder_node(state: GraphState) -> dict:
-    """Ejecuta UNA task con el Coder.
-
-    S8: agrega files_written a all_files_written para que el Auditor
-    tenga acceso a todos los archivos del run al final.
-    """
+    """Ejecuta UNA task con el Coder."""
     task_id = state["current_task_id"]
     assert task_id is not None
     task = _task_by_id(state, task_id)
@@ -166,7 +228,7 @@ async def coder_node(state: GraphState) -> dict:
     )
     return {
         "steps": [step],
-        "all_files_written": result.files_written,  # acumulativo via operator.add
+        "all_files_written": result.files_written,
     }
 
 
@@ -287,17 +349,11 @@ async def tester_node(state: GraphState) -> dict:
 
 
 async def auditor_node(state: GraphState) -> dict:
-    """Corre Bandit+semgrep sobre todos los archivos del run y abre PR en GitHub.
-
-    - findings HIGH  -> status=failed, feedback para el usuario
-    - sin HIGH       -> status=done, PR abierta en GitHub
-    """
+    """Corre Bandit+semgrep sobre todos los archivos del run y abre PR en GitHub."""
     run_id = state["run_id"]
     plan = state["plan"]
     plan_summary = plan.summary if plan else "Run sin plan"
-    all_files = list(dict.fromkeys(state.get("all_files_written") or []))  # dedup preservando orden
-
-    log_step = AgentStep(task_id="__audit__", agent="auditor", status="running", summary="Iniciando auditoría")
+    all_files = list(dict.fromkeys(state.get("all_files_written") or []))
 
     result: AuditorResult = await run_auditor(
         run_id=run_id,
