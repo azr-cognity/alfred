@@ -58,6 +58,10 @@ _DEFAULT_OLLAMA_PARAMS: dict[str, int] = {"num_ctx": 16384, "num_predict": 4096}
 
 _THINK_PATTERN = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 
+# Acumulador de costo del run activo (worker es secuencial — un run a la vez)
+_current_run_cost: float = 0.0
+
+
 
 # ---------------------------------------------------------------------------
 # Tipos de datos
@@ -141,6 +145,8 @@ def _estimate_cost_usd(response: LLMResponse) -> float:
 def _log_llm_call(agent: str, response: LLMResponse, latency_ms: float) -> None:
     """Emitir evento structlog 'llm.call_completed' y alerta de costo si aplica."""
     cost_usd = _estimate_cost_usd(response)
+    global _current_run_cost
+    _current_run_cost = round(_current_run_cost + cost_usd, 6)
     logger.info(
         "llm.call_completed",
         agent=agent,
@@ -346,3 +352,21 @@ def get_provider(agent: str, task_complexity: str = "medium") -> LLMProvider:
     # Tester, Auditor y Coder no-high â†’ local
     local_model = _select_local_model(agent)
     return OllamaProvider(model=local_model, agent=agent, **params)
+
+
+
+
+def reset_run_cost() -> None:
+    """Resetear acumulador al inicio de un run. Llamar desde worker."""
+    global _current_run_cost
+    _current_run_cost = 0.0
+
+
+def get_and_reset_run_cost() -> float:
+    """Leer costo acumulado del run y resetear. Llamar desde worker al finalizar."""
+    global _current_run_cost
+    cost = round(_current_run_cost, 6)
+    _current_run_cost = 0.0
+    return cost
+
+

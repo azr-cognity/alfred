@@ -20,6 +20,7 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.telemetry import capture_exception, init_telemetry, track_event
+from app.core.llm import reset_run_cost, get_and_reset_run_cost
 from app.orchestrator.graph import compiled_graph
 from app.orchestrator.state import AgentStep, initial_state
 
@@ -48,7 +49,7 @@ async def _ensure_group(r: aioredis.Redis) -> None:
             raise
 
 
-async def _update_run_status(run_id: str, status: str, error: str | None = None) -> None:
+async def _update_run_status(run_id: str, status: str, error: str | None = None, cost_usd: float = 0.0) -> None:
     async with AsyncSessionLocal() as session:
         await session.execute(
             text("""
@@ -62,6 +63,7 @@ async def _update_run_status(run_id: str, status: str, error: str | None = None)
                 "id": run_id,
                 "status": status,
                 "error": error,
+                "cost_usd": cost_usd,
                 "completed_at": datetime.now(timezone.utc),
             },
         )
@@ -104,6 +106,7 @@ async def _execute_run(r: aioredis.Redis, run_id: str, prompt: str) -> None:
     log = logger.bind(run_id=run_id)
     log.info("worker.run.start")
 
+    reset_run_cost()
     track_event("run.started", {"run_id": run_id, "prompt_len": len(prompt)})
 
     await _update_run_status(run_id, "running")
@@ -142,8 +145,9 @@ async def _execute_run(r: aioredis.Redis, run_id: str, prompt: str) -> None:
                     log.info("worker.step.saved", task_id=step.task_id, status=step.status)
 
         duration_s = (datetime.now(timezone.utc) - started_at).total_seconds()
+        total_cost = get_and_reset_run_cost()
 
-        await _update_run_status(run_id, final_status, final_error)
+        await _update_run_status(run_id, final_status, final_error, cost_usd=total_cost)
         await _publish(r, run_id, {
             "event": "run_finished",
             "run_id": run_id,
@@ -242,3 +246,10 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
+
+
+
