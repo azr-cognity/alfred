@@ -12,6 +12,7 @@ import json
 import re
 
 import structlog
+from app.agents.routing import select_coder_model
 from json_repair import repair_json
 
 from app.core.config import settings
@@ -319,4 +320,5 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
         f"tras {MAX_RETRIES} intentos. Último error: {last_error}"
     )
     
+
 

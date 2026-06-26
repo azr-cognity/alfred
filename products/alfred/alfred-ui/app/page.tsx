@@ -6,7 +6,7 @@ import { CodeViewer } from "@/components/CodeViewer";
 import { CostBadge } from "@/components/CostBadge";
 import { RunSidebar } from "@/components/RunSidebar";
 import { AgentStep, NodeUpdate, Run } from "@/lib/types";
-import { createRun, getRun, getRuns, getProjects, Project } from "@/lib/api";
+import { createRun, getRun, getRuns, getProjects, Project, getRunSteps } from "@/lib/api";
 import { subscribeToRun } from "@/lib/api";
 
 export default function Home() {
@@ -22,7 +22,7 @@ export default function Home() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
 
-  // Archivos escritos — código real desde result jsonb o placeholder
+  // Archivos escritos - codigo real desde result jsonb o placeholder
   const [codeContent, setCodeContent] = useState<string | null>(null);
   const [codeFilename, setCodeFilename] = useState<string | null>(null);
 
@@ -49,6 +49,7 @@ export default function Home() {
     setError(null);
     setCodeContent(null);
     setCodeFilename(null);
+    setRunCost(null);
 
     const run = await getRun(id).catch(() => null);
     if (!run) return;
@@ -56,8 +57,7 @@ export default function Home() {
     setRunStatus(run.status);
     setRunCost((run as any).cost_usd ?? null);
 
-    // Cargar steps hist�ricos del run
-    const { getRunSteps } = await import("@/lib/api");
+    // Cargar steps historicos del run
     const historical = await getRunSteps(id).catch(() => []);
     if (historical.length > 0) {
       setSteps(historical.map(s => ({
@@ -101,9 +101,11 @@ export default function Home() {
             setRuns(prev => prev.map(r =>
               r.id === id ? { ...r, status: (update.status ?? "done") as Run["status"] } : r
             ));
-            // Recargar detalle para obtener archivos
+            // Recargar detalle para obtener archivos y costo
             getRun(id).then(updated => {
-              if (!updated?.result) return;
+              if (!updated) return;
+              setRunCost((updated as any).cost_usd ?? null);
+              if (!updated.result) return;
               const result = updated.result as Record<string, unknown>;
               const files = result.files_written as Record<string, string> | undefined;
               if (files) {
@@ -133,6 +135,7 @@ export default function Home() {
     setError(null);
     setCodeContent(null);
     setCodeFilename(null);
+    setRunCost(null);
   }, []);
 
   const handleRun = useCallback(async (prompt: string) => {
@@ -144,6 +147,7 @@ export default function Home() {
     setError(null);
     setCodeContent(null);
     setCodeFilename(null);
+    setRunCost(null);
 
     try {
       const { id } = await createRun(prompt, activeProjectId);
@@ -168,9 +172,11 @@ export default function Home() {
             setRuns(prev => prev.map(r =>
               r.id === id ? { ...r, status: (update.status ?? "done") as Run["status"] } : r
             ));
-            // Recargar detalle para obtener archivos generados
+            // Recargar detalle para obtener archivos y costo
             getRun(id).then(updated => {
-              if (!updated?.result) return;
+              if (!updated) return;
+              setRunCost((updated as any).cost_usd ?? null);
+              if (!updated.result) return;
               const result = updated.result as Record<string, unknown>;
               const files = result.files_written as Record<string, string> | undefined;
               if (files) {
@@ -198,7 +204,7 @@ export default function Home() {
   }, [activeProjectId]);
 
   const showCode = codeContent ?? (lastFilesStep
-    ? "# Los archivos generados aparecen aquí\n# Ejecuta un run para ver el código real"
+    ? "# Los archivos generados aparecen aqui\n# Ejecuta un run para ver el codigo real"
     : null);
   const showFilename = codeFilename ?? lastFilesStep?.files_written[0] ?? null;
 
@@ -229,8 +235,7 @@ export default function Home() {
             {activeRunId ? (
               <>
                 <span style={{ fontFamily: "monospace" }}>{activeRunId.slice(0, 8)}</span>
-{runCost !== null && <CostBadge cost_usd={runCost} />}
-                                {runStatus && (
+                {runStatus && (
                   <span style={{
                     marginLeft: 10,
                     fontSize: 11,
@@ -247,6 +252,11 @@ export default function Home() {
                     letterSpacing: "0.05em",
                   }}>
                     {runStatus}
+                  </span>
+                )}
+                {runCost !== null && (
+                  <span style={{ marginLeft: 8 }}>
+                    <CostBadge cost_usd={runCost} />
                   </span>
                 )}
               </>
@@ -336,10 +346,10 @@ export default function Home() {
                 ⚡
               </div>
               <p style={{ fontSize: 14, fontWeight: 500, color: "var(--text)" }}>
-                Describe qué quieres construir
+                Describe que quieres construir
               </p>
               <p style={{ fontSize: 13, textAlign: "center", maxWidth: 340 }}>
-                Alfred planificará, codificará, revisará y abrirá un PR automáticamente.
+                Alfred planificara, codificara, revisara y abrira un PR automaticamente.
               </p>
             </div>
           )}
@@ -348,8 +358,3 @@ export default function Home() {
     </div>
   );
 }
-
-
-
-
-
