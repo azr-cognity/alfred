@@ -56,6 +56,7 @@ async def _update_run_status(run_id: str, status: str, error: str | None = None,
                 UPDATE agent_runs
                 SET status       = :status,
                     error        = :error,
+                    cost_usd     = :cost_usd,
                     completed_at = :completed_at
                 WHERE id = :id
             """),
@@ -246,6 +247,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
