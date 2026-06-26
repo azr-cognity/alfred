@@ -3,6 +3,7 @@ import { useState, useCallback, useEffect } from "react";
 import { PromptBar } from "@/components/PromptBar";
 import { PipelineView } from "@/components/PipelineView";
 import { CodeViewer } from "@/components/CodeViewer";
+import { CostBadge } from "@/components/CostBadge";
 import { RunSidebar } from "@/components/RunSidebar";
 import { AgentStep, NodeUpdate, Run } from "@/lib/types";
 import { createRun, getRun, getRuns, getProjects, Project } from "@/lib/api";
@@ -17,6 +18,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [runStatus, setRunStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [runCost, setRunCost] = useState<number | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
 
@@ -52,6 +54,21 @@ export default function Home() {
     if (!run) return;
 
     setRunStatus(run.status);
+    setRunCost((run as any).cost_usd ?? null);
+
+    // Cargar steps históricos del run
+    const { getRunSteps } = await import("@/lib/api");
+    const historical = await getRunSteps(id).catch(() => []);
+    if (historical.length > 0) {
+      setSteps(historical.map(s => ({
+        task_id: s.output?.task_id ?? "",
+        agent: s.agent_name,
+        status: s.status as any,
+        summary: s.output?.summary ?? "",
+        files_written: s.output?.files_written ?? [],
+        error: s.output?.error ?? undefined,
+      })));
+    }
 
     // Extraer archivos desde result jsonb si existen
     if (run.result && typeof run.result === "object") {
@@ -212,7 +229,8 @@ export default function Home() {
             {activeRunId ? (
               <>
                 <span style={{ fontFamily: "monospace" }}>{activeRunId.slice(0, 8)}</span>
-                {runStatus && (
+{runCost !== null && <CostBadge cost_usd={runCost} />}
+                                {runStatus && (
                   <span style={{
                     marginLeft: 10,
                     fontSize: 11,
@@ -330,3 +348,8 @@ export default function Home() {
     </div>
   );
 }
+
+
+
+
+

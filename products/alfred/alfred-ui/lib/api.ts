@@ -94,3 +94,18 @@ export function subscribeToRun(
 
   return () => es.close();
 }
+
+export interface Step {
+  id: string;
+  agent_name: string;
+  status: string;
+  output: { task_id: string; summary: string; files_written: string[]; error: string | null } | null;
+  cost_usd: number | null;
+  created_at: string;
+}
+
+export async function getRunSteps(runId: string): Promise<Step[]> {
+  const res = await fetch(`${API}/api/v1/runs/${runId}/steps`);
+  if (!res.ok) return [];
+  return res.json();
+}
