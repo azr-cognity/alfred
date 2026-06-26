@@ -13,6 +13,7 @@ import re
 
 import structlog
 from app.agents.routing import select_coder_model
+from app.core.llm import OllamaProvider, AnthropicProvider
 from json_repair import repair_json
 
 from app.core.config import settings
@@ -265,15 +266,17 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
     for attempt in range(1, MAX_RETRIES + 1):
         log_attempt = log.bind(attempt=attempt)
         log_attempt.info("coder.attempt")
-
         try:
-            response = await ollama.generate(
-                prompt=user_prompt,
-                system=SYSTEM_PROMPT,
-                model=select_coder_model(task)[1],
-                format=None,   # json-repair maneja docstrings — no necesitamos grammar constraint
-                num_ctx=32768,
-            )
+            _p_type, _p_model = select_coder_model(task)
+            if _p_type == "frontier":
+                from app.core.llm import AnthropicProvider
+                _prov = AnthropicProvider(model=_p_model, agent="coder")
+                _resp = await _prov.generate(system=SYSTEM_PROMPT, user=user_prompt, max_tokens=8192)
+            else:
+                from app.core.llm import OllamaProvider
+                _prov = OllamaProvider(model=_p_model, agent="coder", num_ctx=32768, num_predict=8192)
+                _resp = await _prov.generate(system=SYSTEM_PROMPT, user=user_prompt)
+            response = _resp.content
 
             data = _parse_response(response, log_attempt)
 
@@ -320,5 +323,7 @@ está relacionado con SQLModel, asyncpg, imports o tipos de datos.
         f"tras {MAX_RETRIES} intentos. Último error: {last_error}"
     )
     
+
+
 
 
