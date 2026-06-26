@@ -1,109 +1,94 @@
 """
-Agente Architect — el planificador de Alfred.
+Agente Architect — el planificador de Alfred (S12).
 
-Responsabilidad:
-  Recibe un prompt en lenguaje natural y produce un plan JSON estructurado
-  con tareas atómicas, prioridades y dependencias.
+Cambios respecto a S11:
+  - Lee ALFRED_MISSION.md antes de planificar (Paso 1).
+  - format=None en ollama.generate (format=json causaba response_len=0).
+  - SYSTEM_PROMPT simplificado — las reglas de planning van en ALFRED_MISSION.md.
 
-Cómo funciona:
-  1. Recibe el prompt del usuario
-  2. Construye un system prompt con el contexto del proyecto (stack, constraints)
-  3. Llama a qwen3.5:35b-a3b via Ollama
-  4. Parsea la respuesta JSON en un objeto Plan validado por Pydantic
-  5. Si el JSON es inválido, reintenta hasta MAX_RETRIES veces
+Cambios v2.4 (ADR-008, ADR-011):
+  - Migrado a get_provider("architect") — usa Claude API en modo hybrid.
+  - _extract_json ya no necesita strip_think: OllamaProvider lo centraliza.
+  - temperature=0.3 pasada explícitamente a provider.generate().
 """
 
 import json
 import re
+from pathlib import Path
 
 import structlog
 
-from app.core.config import settings
-from app.core.ollama import ollama
+from app.core.llm import get_provider
 from app.schemas.runs import Plan, Task, TaskPriority
 
 logger = structlog.get_logger()
 
 MAX_RETRIES = 3
+MISSION_PATH = "ALFRED_MISSION.md"
 
-# ── System prompt ──────────────────────────────────────────────────────────────
-# Este es el "cerebro" del Architect. Define su rol, restricciones y el
-# formato exacto que debe producir. Es la pieza más importante del agente.
+SYSTEM_PROMPT = """Eres el Architect de Alfred, un asistente de desarrollo con agentes IA.
 
-SYSTEM_PROMPT = """Eres el Architect de Alfred, un asistente de desarrollo de software.
+Tu unica responsabilidad es analizar un objetivo de desarrollo y producir un plan
+estructurado de implementacion con tasks atomicas.
 
-Tu única responsabilidad es analizar un objetivo de desarrollo y producir un plan
-estructurado de implementación en formato JSON.
+Lee el archivo ALFRED_MISSION.md que se incluye en el prompt — contiene las reglas
+obligatorias de planning que DEBES seguir sin excepcion.
 
-## Stack canónico del proyecto
-- Backend: FastAPI (Python 3.11) + SQLModel + Pydantic v2
-- Frontend: Next.js 15 App Router + shadcn/ui + Tailwind
-- Base de datos: Postgres + pgvector
-- Tests: pytest (backend) + vitest (frontend)
-- Linting: ruff + mypy
+Las reglas mas criticas (no las olvides):
+- agent="coder" para CUALQUIER task que cree o modifique archivos, incluyendo tests.
+- agent="tester" SOLO para verificar si codigo existente pasa pytest.
+- files_to_create o files_to_modify SIEMPRE con rutas explicitas.
+- Maximo 3 tasks por plan.
 
-## Reglas de planificación
-1. Descompone el objetivo en tareas ATÓMICAS — cada tarea debe poder completarse en <100 líneas de código
-2. Cada tarea tiene exactamente UN agente responsable: "coder", "tester" o "reviewer"
-3. Las dependencias deben formar un grafo acíclico (sin ciclos)
-4. Prioriza las tareas de infraestructura (modelos, schemas) antes que la lógica de negocio
-5. Nunca propongas tecnologías fuera del stack canónico sin justificación explícita
-6. Identifica riesgos reales, no genéricos
-
-## Formato de respuesta
-Responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional, sin markdown, sin explicaciones.
-El JSON debe seguir exactamente esta estructura:
+Responde UNICAMENTE con JSON valido, sin texto adicional, sin markdown.
 
 {
-  "summary": "descripción breve de qué se va a implementar",
-  "stack_notes": "notas específicas sobre decisiones de stack para esta tarea",
+  "summary": "descripcion breve de que se va a implementar",
+  "stack_notes": "notas especificas sobre decisiones de stack para esta tarea",
   "risks": ["riesgo 1", "riesgo 2"],
   "tasks": [
     {
       "id": "task_1",
-      "title": "título corto de la tarea",
-      "description": "descripción detallada de qué implementar y cómo",
+      "title": "Verbo en infinitivo + que se hace",
+      "description": "descripcion tecnica con rutas de archivos, contratos esperados y patron de referencia",
       "agent": "coder",
       "priority": "high",
       "depends_on": [],
       "estimated_complexity": "low",
-      "files_to_create": ["ruta/al/archivo.py"],
+      "files_to_create": ["ruta/relativa/al/archivo.py"],
       "files_to_modify": []
     }
   ]
 }
 
-Valores válidos:
+Valores validos:
 - agent: "coder" | "tester" | "reviewer"
 - priority: "high" | "medium" | "low"
 - estimated_complexity: "low" | "medium" | "high"
+/no_think
 """
 
 
 def _extract_json(text: str) -> str:
+    """Extrae JSON de la respuesta del modelo.
+
+    No aplica strip_think: OllamaProvider ya lo centraliza (ADR-011).
+    AnthropicProvider no emite <think> (Gotcha #27).
     """
-    Extrae el JSON de la respuesta del modelo.
-    El modelo a veces incluye texto antes o después del JSON,
-    o lo envuelve en ```json ... ```. Esta función lo limpia.
-    """
-    # Intentar extraer de bloque markdown
-    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         return match.group(1).strip()
-
-    # Intentar encontrar el objeto JSON directamente
     match = re.search(r"\{[\s\S]*\}", text)
     if match:
         return match.group(0).strip()
-
     return text.strip()
 
 
 def _parse_plan(raw_json: str) -> Plan:
-    """
-    Parsea el JSON del modelo en un objeto Plan validado.
-    Lanza ValueError si el JSON es inválido o no tiene la estructura esperada.
+    """Parsea el JSON del modelo en un objeto Plan validado.
+
+    Raises:
+        ValueError: Si el JSON es invalido o no tiene la estructura esperada.
     """
     data = json.loads(raw_json)
 
@@ -129,51 +114,89 @@ def _parse_plan(raw_json: str) -> Plan:
     )
 
 
-async def run_architect(prompt: str) -> Plan:
+async def _read_mission() -> str:
+    """Lee ALFRED_MISSION.md desde el PROJECT_ROOT del Coder.
+
+    Si no existe, retorna string vacío — el Architect opera sin contexto de misión.
     """
-    Punto de entrada del agente Architect.
+    try:
+        from app.agents.coder_tools import PROJECT_ROOT
+        mission_path = PROJECT_ROOT / MISSION_PATH
+        if mission_path.exists():
+            content = mission_path.read_text(encoding="utf-8", errors="ignore")
+            logger.info("architect.mission_loaded", size=len(content))
+            return content
+        else:
+            logger.warning("architect.mission_not_found", path=str(mission_path))
+            return ""
+    except Exception as e:
+        logger.warning("architect.mission_read_error", error=str(e))
+        return ""
+
+
+async def run_architect(prompt: str) -> Plan:
+    """Punto de entrada del agente Architect.
+
+    Lee ALFRED_MISSION.md antes de planificar. En modo hybrid usa Claude API
+    (ADR-008); en full_local usa Ollama — transparente para este módulo (ADR-011).
 
     Args:
-        prompt: el objetivo del usuario en lenguaje natural
+        prompt: el objetivo del usuario en lenguaje natural.
 
     Returns:
-        Plan validado con tareas, prioridades y dependencias
+        Plan validado con tasks, prioridades y dependencias.
 
     Raises:
-        ValueError: si no puede producir un plan válido tras MAX_RETRIES intentos
+        ValueError: Si no puede producir un plan válido tras MAX_RETRIES intentos.
     """
     log = logger.bind(agent="architect", prompt_len=len(prompt))
     log.info("architect.start")
+
+    # Paso 1: leer ALFRED_MISSION.md
+    mission = await _read_mission()
+    mission_section = ""
+    if mission:
+        mission_section = f"\n\n## ALFRED_MISSION.md — reglas obligatorias de planning\n{mission}"
+
+    # ADR-011: get_provider() decide Ollama vs Claude API según settings.llm_mode
+    # complexity="medium" → sonnet en hybrid (opus se activa con complexity="high")
+    provider = get_provider("architect", task_complexity="medium")
 
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         log.info("architect.attempt", attempt=attempt)
 
-        # Si es un reintento, añade el error anterior como contexto
-        user_prompt = prompt
+        user_prompt = f"{prompt}{mission_section}"
+
         if last_error and attempt > 1:
-            user_prompt = (
-                f"{prompt}\n\n"
-                f"NOTA: Tu respuesta anterior falló con este error: {last_error}\n"
-                f"Asegúrate de responder ÚNICAMENTE con JSON válido."
+            user_prompt += (
+                f"\n\nNOTA: intento anterior falló con: {last_error}. "
+                "Responde ÚNICAMENTE con JSON válido. "
+                "Recuerda: agent='coder' para cualquier task que cree archivos."
             )
 
         try:
-            response = await ollama.generate(
-                prompt=user_prompt,
+            # ADR-008: frontier en modo hybrid; ADR-011: interfaz única
+            llm_response = await provider.generate(
                 system=SYSTEM_PROMPT,
-                model=settings.ollama_model,
+                user=user_prompt,
+                temperature=0.3,
             )
 
-            raw_json = _extract_json(response)
+            raw_json = _extract_json(llm_response.content)
             plan = _parse_plan(raw_json)
 
-            log.info(
-                "architect.done",
-                tasks=len(plan.tasks),
-                attempt=attempt,
-            )
+            # Advertir si hay tasks de coder sin archivos declarados
+            for task in plan.tasks:
+                if task.agent == "coder" and not task.files_to_create and not task.files_to_modify:
+                    log.warning(
+                        "architect.task_sin_archivos",
+                        task_id=task.id,
+                        title=task.title,
+                    )
+
+            log.info("architect.done", tasks=len(plan.tasks), attempt=attempt)
             return plan
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
